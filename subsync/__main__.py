@@ -13,6 +13,11 @@ from subsync.settings import settings
 
 def subsync(argv=None):
     args = cmdargs.parseCmdArgs(argv)
+    if args is None:
+        return 2
+    if args.get('help_printed'):
+        return 0
+
     options = args.get('options', {})
 
     if options.get('logLevel') or options.get('logFile'):
@@ -31,6 +36,18 @@ def subsync(argv=None):
         print('subsync version {} on {}'.format(version()[0], sys.platform))
         return 0
 
+    if args.get('subcommand') == 'gui':
+        from subsync.web_gui import run_web_gui
+        gui_args = args.get('gui_args') or {}
+        return run_web_gui(
+            host=gui_args.get('host', '127.0.0.1'),
+            port=gui_args.get('port', 8765),
+            open_browser=gui_args.get('open_browser', True),
+        )
+
+    if args.get('subcommand') in ('batch', 'series'):
+        return cli(**args)
+
     if not args.get('cli'):
         if os.path.basename(os.path.splitext(sys.argv[0])[0]) == 'subsync-cmd':
             logger.info("running command 'subsync-cmd', starting in headless mode")
@@ -39,6 +56,9 @@ def subsync(argv=None):
             try:
                 import wx
             except Exception as e:
+                if not args.get('sync') and not args.get('fromFile'):
+                    from subsync.web_gui import run_web_gui
+                    return run_web_gui()
                 logger.warning("couldn't start wx, falling back to headless mode, %r", e)
                 args['cli'] = True
 
@@ -85,8 +105,8 @@ def gui(sync=None, fromFile=None, batch=False, options={}, **args):
         settings().save()
 
 
-def cli(sync=None, fromFile=None, verbose=1, offline=False, options={}, **args):
-    from subsync import cli
+def cli(sync=None, fromFile=None, verbose=1, offline=False, options={}, subcommand=None, batch_args=None, series_args=None, **args):
+    from subsync import cli as cli_mod
 
     if sys.platform == 'win32':
         try:
@@ -96,18 +116,28 @@ def cli(sync=None, fromFile=None, verbose=1, offline=False, options={}, **args):
             sys.stderr = open('CONOUT$', 'w')
             sys.stdin = open('CONIN$', 'r')
         except Exception as err:
-            cli.pr.printException(0, err, 'console allocation failed')
+            cli_mod.pr.printException(0, err, 'console allocation failed')
 
     try:
         _init(options)
-        tasks = _loadTasks(sync, fromFile)
-
     except Exception as err:
-        cli.pr.printException(0, err)
+        cli_mod.pr.printException(0, err)
+        return 1
+
+    if subcommand == 'batch':
+        return cli_mod.runBatchCommand(batch_args or {}, verbosity=verbose)
+
+    if subcommand == 'series':
+        return cli_mod.runSeriesCommand(series_args or {}, verbosity=verbose)
+
+    try:
+        tasks = _loadTasks(sync, fromFile)
+    except Exception as err:
+        cli_mod.pr.printException(0, err)
         return 1
 
     try:
-        app = cli.App(verbosity=verbose, offline=offline)
+        app = cli_mod.App(verbosity=verbose, offline=offline)
         return app.runTasks(tasks)
 
     except Exception as err:
@@ -119,8 +149,8 @@ def version():
     try:
         from subsync.version import version, version_short
         return version_short, version
-    except:
-        return None, 'UNDEFINED'
+    except Exception:
+        return '0.17.0', '0.17.0-modern'
 
 
 def _init(options={}):
@@ -153,4 +183,3 @@ def _loadTasks(sync=None, fromFile=None):
 if __name__ == "__main__":
     res = subsync()
     sys.exit(res)
-

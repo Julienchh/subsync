@@ -40,8 +40,18 @@ class Printer(object):
 pr = Printer()
 
 
+def _is_native_gizmo_active():
+    try:
+        import gizmo
+        return not getattr(gizmo, '_IS_MODERN_FALLBACK', False)
+    except Exception:
+        return False
+
+
 class AssetsVerifier(object):
     def run(self, tasks):
+        if not _is_native_gizmo_active():
+            return True
         assets = assetManager().getAssetsForTasks(tasks)
 
         if assets.notInstalled():
@@ -58,6 +68,8 @@ class AssetsVerifier(object):
 
 class AssetsDownloader(AssetsVerifier):
     def run(self, tasks):
+        if not _is_native_gizmo_active():
+            return True
         self.updateAssetList()
         assets = assetManager().getAssetsForTasks(tasks)
 
@@ -111,6 +123,66 @@ class AssetsDownloader(AssetsVerifier):
             pr.reprint(1, ''.join(msg))
 
 
+def runBatchCommand(batch_args, verbosity=1):
+    from subsync.batch import BatchConfig, BatchProgressReporter, run_batch, print_summary_table
+    pr.verbosity = verbosity
+    cfg = BatchConfig(
+        ref_dir=batch_args.get('ref_dir'),
+        sub_dir=batch_args.get('sub_dir'),
+        ref_pattern=batch_args.get('ref_pattern'),
+        sub_pattern=batch_args.get('sub_pattern'),
+        out_dir=batch_args.get('out_dir'),
+        out_pattern=batch_args.get('out_pattern') or '{ref_dir}/{ref_name}.synced.srt',
+        in_place=bool(batch_args.get('in_place', False)),
+        backup=bool(batch_args.get('backup', False)),
+        skip_if_exists=bool(batch_args.get('skip_if_exists', False)),
+        recursive=bool(batch_args.get('recursive', False)),
+        matcher_mode=batch_args.get('matcher_mode') or 'auto',
+        lang=batch_args.get('lang'),
+        ref_lang=batch_args.get('ref_lang'),
+        task_timeout=float(batch_args.get('task_timeout', 300.0)),
+        continue_on_error=bool(batch_args.get('continue_on_error', True)),
+        dry_run=bool(batch_args.get('dry_run', False)),
+        jobs=int(batch_args.get('jobs', 1)),
+        summary_json=batch_args.get('summary_json'),
+        verbose=verbosity,
+    )
+    reporter = BatchProgressReporter(verbose=verbosity)
+    summary = run_batch(cfg, progress_callback=reporter)
+    if verbosity >= 1:
+        print_summary_table(summary)
+    return summary.exit_code
+
+
+def runSeriesCommand(series_args, verbosity=1):
+    from subsync.download import run_series_sync
+    pr.verbosity = verbosity
+    series_dir = series_args.get('series_dir')
+    if not series_dir:
+        pr.println(0, '[!] missing required series directory (usage: subsync series <SERIES_DIR> --lang fr)')
+        return 1
+    summary = run_series_sync(
+        series_dir=series_dir,
+        target_lang=series_args.get('target_lang') or 'fr',
+        ref_lang=series_args.get('ref_lang'),
+        provider=series_args.get('provider') or 'auto',
+        opensubtitles_api_key=series_args.get('opensubtitles_api_key'),
+        out_pattern=series_args.get('out_pattern') or '{ref_dir}/{ref_name}.{lang}.synced.srt',
+        cache_dir=series_args.get('cache_dir'),
+        max_episodes=series_args.get('max_episodes'),
+        episodes_filter=series_args.get('episodes_filter'),
+        season_filter=series_args.get('season_filter'),
+        recursive=bool(series_args.get('recursive', False)),
+        dry_run=bool(series_args.get('dry_run', False)),
+        skip_if_exists=bool(series_args.get('skip_if_exists', False)),
+        task_timeout=float(series_args.get('task_timeout', 300.0)),
+        workers=int(series_args.get('workers', 0)),
+        summary_json=series_args.get('summary_json'),
+        quiet=(verbosity <= 0),
+    )
+    return summary.exit_code
+
+
 class App(object):
     def __init__(self, verbosity=1, offline=False):
         pr.verbosity = verbosity
@@ -129,24 +201,33 @@ class App(object):
         self.succeeded = 0
         sync = None
 
-        try:
-            validator.validateTasks(tasks, outputRequired=True)
-        except Exception as err:
-            pr.printException(0, err)
+        valid_tasks = []
+        validation_failures = 0
+        for task in tasks:
+            try:
+                validator.validateTask(task, outputRequired=True)
+                valid_tasks.append(task)
+            except Exception as err:
+                pr.printException(0, err)
+                validation_failures += 1
+
+        if not valid_tasks:
             return 1
 
         try:
-            if not self.assetsDownloader.run(tasks):
+            if not self.assetsDownloader.run(valid_tasks):
                 return 2
 
             sync = SyncController(listener=self)
-            sync.synchronize(tasks, timeout=1)
+            sync.synchronize(valid_tasks, timeout=1)
             sync.wait()
 
-            if self.succeeded == len(tasks):
+            if self.succeeded == len(tasks) and validation_failures == 0:
                 return 0
-            else:
+            elif self.succeeded > 0:
                 return 2
+            else:
+                return 1 if validation_failures == len(tasks) else 2
 
         except KeyboardInterrupt:
             pr.println(1, '[-] interrupted by user')

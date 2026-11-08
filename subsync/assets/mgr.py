@@ -12,11 +12,9 @@ class AssetManager(object):
 
     Assets are used for synchronization (speech recognition models,
     dictionaries) and application updates.
-    Assets are available on remote server and could be installed locally.
-    Single asset contains information for both local and remote part.
-    Local part is not available if asset is not installed locally.
-    Remote part is not available if there is no such asset on server or
-    synchronization with server was not performed.
+    Note: The modernized VAD + FFT/OLS synchronization engine is
+    language-agnostic and does not require remote PocketSphinx models
+    or bilingual dictionaries.
     """
 
     _instance = None
@@ -53,12 +51,7 @@ class AssetManager(object):
                 updAsset._removeLocalData()
 
     def getAsset(self, assetId, params=None):
-        """Get asset of given ID or type/params.
-
-        Returned asset could have local and/or remote part set, or none if such
-        asset don't exist.
-        For given ID always the same object will be returned.
-        """
+        """Get asset of given ID or type/params."""
         if params:
             typ = assetId
             par = params
@@ -79,39 +72,13 @@ class AssetManager(object):
     def getAssetsForTasks(self, tasks):
         """Get assets list for requested tasks.
 
-        Parameters
-        ----------
-        tasks: iterable of subsync.synchro.SyncTask
-
-        Returns
-        -------
-        subsync.assets.AssetList
+        With the modern language-agnostic VAD synchronization engine, external
+        PocketSphinx models and translation dictionaries are not required.
         """
-        assets = set()
-        for task in tasks:
-            sub, ref = task.sub, task.ref
-            if ref and ref.type == 'audio':
-                assets.add(self.getAsset('speech', [ref.lang]))
-            if sub and sub.lang and ref and ref.lang and sub.lang != ref.lang:
-                langs = sorted([sub.lang, ref.lang])
-                assets.add(self.getAsset('dict', langs))
-        return assetlist.AssetList(assets)
+        return assetlist.AssetList()
 
     def getAssetListUpdater(self, autoUpdate=False):
-        """Get remote assets list updater.
-
-        Parameters
-        ----------
-        autoUpdate: bool, optional
-            When `True`, application upgrade will be downloaded automatically
-            after list update (if upgrade is available).
-            Setting `autoUpdate` has effect only on first call to this method.
-
-        Returns
-        -------
-        subsync.assets.listupdater.ListUpdater
-            Will return the same object for subsequent calls.
-        """
+        """Get remote assets list updater."""
 
         def onUpdate(assets):
             if assets:
@@ -124,13 +91,7 @@ class AssetManager(object):
         return self._listUpdater
 
     def runSelfUpdater(self):
-        """Start self upgrade if available.
-
-        Returns
-        -------
-        subsync.assets.downloader.AssetDownloader or None
-            `None` if upgrade is not available.
-        """
+        """Start self upgrade if available."""
         asset = self.getSelfUpdaterAsset()
         if asset and asset.hasUpdate() and not asset.hasInstaller():
             logger.info('new version available to download, %s -> %s',
@@ -152,7 +113,6 @@ class AssetManager(object):
         logger.info('updating remote asset list, got %i assets', len(assets))
         for id, remote in assets.items():
             if item.validateRemoteData(remote):
-                asset = self.getAsset(id)
                 self.getAsset(id)._setRemoteData(remote)
             else:
                 logger.warning('invalid asset remote data: %r', remote)

@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-
+import os
 import sys
+
+_script_path = os.path.realpath(__file__)
+_repo_root = os.path.dirname(_script_path)
+_ai_env = os.path.join(_repo_root, '.ai_env')
+
+for _p in (_repo_root, _ai_env):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from subsync.__main__ import subsync
 
-res = subsync()
-sys.exit(res)
+if __name__ == '__main__':
+    sys.exit(subsync())

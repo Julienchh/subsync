@@ -1,6 +1,6 @@
 certifi
-cryptography>=2.8
-pysubs2>=0.2.4
 PyYAML
-pybind11>=2.4
 requests>=2.0
+numpy>=1.22
+onnxruntime>=1.16
+faster-whisper>=1.0

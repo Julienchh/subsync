@@ -1,10 +1,247 @@
 from subsync.data import descriptions
+from subsync.translations import _
+import argparse
 import textwrap
 import sys
 
 
+def _parse_episode_list(val):
+    if not val:
+        return None
+    episodes = []
+    for part in str(val).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            episodes.extend(range(int(a), int(b) + 1))
+        else:
+            episodes.append(int(part))
+    return sorted(set(episodes))
+
+
+def buildBatchParser():
+    parser = argparse.ArgumentParser(
+        prog='subsync batch',
+        description='Unattended batch resynchronization across multiple video and subtitle files.',
+        add_help=False,
+    )
+    parser.add_argument('pos_ref_dir', nargs='?', default=None, help='Directory containing reference video files')
+    parser.add_argument('--help', '-h', action='store_true', help='Show this help message and exit')
+    parser.add_argument('--ref-dir', '--video-dir', dest='ref_dir', default=None, help='Directory containing reference video files')
+    parser.add_argument('--sub-dir', dest='sub_dir', default=None, help='Directory containing subtitle files (default: same as ref-dir)')
+    parser.add_argument('--ref', '--ref-pattern', dest='ref_pattern', default=None, help='Glob pattern for reference video files')
+    parser.add_argument('--sub', '--sub-pattern', dest='sub_pattern', default=None, help='Glob pattern for subtitle files')
+    parser.add_argument('--out-dir', dest='out_dir', default=None, help='Directory to save synchronized subtitles')
+    parser.add_argument('--out-pattern', dest='out_pattern', default=None, help='Output filename template (default: {ref_dir}/{ref_name}.synced.srt)')
+    parser.add_argument('--jellyfin', dest='jellyfin', action='store_true', help='Use Jellyfin/Plex naming convention ({ref_dir}/{ref_name}.{lang}.srt)')
+    parser.add_argument('--jellyfin-default', dest='jellyfin_default', action='store_true', help='Use Jellyfin default subtitle naming ({ref_dir}/{ref_name}.{lang}.default.srt)')
+    parser.add_argument('--in-place', dest='in_place', action='store_true', help='Safely replace original subtitle file in-place')
+    parser.add_argument('--backup', dest='backup', action='store_true', help='Create backup (.bak) when using --in-place')
+    parser.add_argument('--skip-if-exists', dest='skip_if_exists', action='store_true', help='Skip task if output file already exists')
+    parser.add_argument('--force', '--overwrite', dest='skip_if_exists', action='store_false', help='Force overwrite of existing synchronized subtitles')
+    parser.add_argument('--matcher', dest='matcher_mode', choices=['auto', 'episode', 'name', 'fuzzy'], default='auto', help='File pairing algorithm')
+    parser.add_argument('--lang', '-l', '--sub-lang', dest='lang', default=None, help='Subtitle language code (e.g. fr, fra, en)')
+    parser.add_argument('--ref-lang', dest='ref_lang', default=None, help='Reference audio language code (e.g. eng, en)')
+    parser.add_argument('--recursive', '-R', dest='recursive', action='store_true', help='Scan directories recursively')
+    parser.add_argument('--task-timeout', dest='task_timeout', type=float, default=300.0, help='Timeout per task in seconds')
+    parser.add_argument('--continue-on-error', dest='continue_on_error', action='store_true', default=True, help='Continue remaining tasks if one fails')
+    parser.add_argument('--fail-fast', dest='continue_on_error', action='store_false', help='Stop batch on first task failure')
+    parser.add_argument('--dry-run', dest='dry_run', action='store_true', help='Show matched pairs without synchronizing')
+    parser.add_argument('--jobs', '-j', dest='jobs', type=int, default=1, help='Number of concurrent synchronization jobs')
+    parser.add_argument('--summary-json', '--report-json', dest='summary_json', default=None, help='Write batch execution summary to a JSON file')
+    parser.add_argument('--verbose', '-v', dest='verbose', type=int, default=1, help='Verbosity level (0..3)')
+    parser.add_argument('--loglevel', dest='logLevel', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default=None)
+    parser.add_argument('--logfile', dest='logFile', default=None)
+    return parser
+
+
+def buildSeriesParser():
+    parser = argparse.ArgumentParser(
+        prog='subsync series',
+        description='Automated subtitle download and resynchronization for TV series episodes.',
+        add_help=False,
+    )
+    parser.add_argument('pos_series_dir', nargs='?', default=None, help='Directory containing series episode video files')
+    parser.add_argument('--help', '-h', action='store_true', help='Show this help message and exit')
+    parser.add_argument('--series-dir', '--dir', dest='series_dir', default=None, help='Directory containing series episode video files')
+    parser.add_argument('--lang', '-l', dest='lang', default='fr', help='Target subtitle language to download (default: fr)')
+    parser.add_argument('--ref-lang', dest='ref_lang', default=None, help='Reference audio language (default: auto-detected via ffprobe)')
+    parser.add_argument('--provider', dest='provider', choices=['auto', 'addic7ed', 'opensubtitles', 'podnapisi', 'subdl', 'mock'], default='auto', help='Online subtitle provider')
+    parser.add_argument('--opensubtitles-api-key', dest='opensubtitles_api_key', default=None, help='API key for OpenSubtitles REST API v2')
+    parser.add_argument('--out-pattern', dest='out_pattern', default=None, help='Output filename template (default: {ref_dir}/{ref_name}.{lang}.synced.srt)')
+    parser.add_argument('--jellyfin', dest='jellyfin', action='store_true', help='Use Jellyfin/Plex naming convention ({ref_dir}/{ref_name}.{lang}.srt)')
+    parser.add_argument('--jellyfin-default', dest='jellyfin_default', action='store_true', help='Use Jellyfin default subtitle naming ({ref_dir}/{ref_name}.{lang}.default.srt)')
+    parser.add_argument('--cache-dir', dest='cache_dir', default=None, help='Local cache directory for downloaded subtitles')
+    parser.add_argument('--max-episodes', dest='max_episodes', type=int, default=None, help='Maximum number of episodes to process')
+    parser.add_argument('--episodes', dest='episodes_filter', type=_parse_episode_list, default=None, help='Episode numbers to process (e.g. 1,2,5-8)')
+    parser.add_argument('--season', dest='season_filter', type=int, default=None, help='Filter by season number')
+    parser.add_argument('--recursive', '-R', dest='recursive', action='store_true', help='Scan series directory recursively')
+    parser.add_argument('--skip-if-exists', dest='skip_if_exists', action='store_true', help='Skip download/sync if synchronized subtitle already exists')
+    parser.add_argument('--force', '--overwrite', dest='skip_if_exists', action='store_false', help='Force overwrite of existing synchronized subtitles')
+    parser.add_argument('--task-timeout', dest='task_timeout', type=float, default=300.0, help='Timeout per episode synchronization in seconds')
+    parser.add_argument('--workers', '--jobs', '-j', dest='workers', type=int, default=0, help='Number of parallel episode worker processes (0 = auto multi-core)')
+    parser.add_argument('--dry-run', dest='dry_run', action='store_true', help='Display planned episode downloads and sync actions without executing')
+    parser.add_argument('--summary-json', '--report-json', dest='summary_json', default=None, help='Write series execution summary to a JSON file')
+    parser.add_argument('--verbose', '-v', dest='verbose', type=int, default=1, help='Verbosity level (0..3)')
+    parser.add_argument('--loglevel', dest='logLevel', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default=None)
+    parser.add_argument('--logfile', dest='logFile', default=None)
+    return parser
+
+
+def buildGuiParser():
+    parser = argparse.ArgumentParser(
+        prog='subsync gui',
+        description='Launch the standalone SubSync Studio GUI (Hybrid Math + Local AI).',
+        add_help=False,
+    )
+    parser.add_argument('--help', '-h', action='store_true', help='Show this help message and exit')
+    parser.add_argument('--host', dest='host', default='127.0.0.1', help='Host interface to bind (default: 127.0.0.1)')
+    parser.add_argument('--port', '-p', dest='port', type=int, default=8765, help='Port to bind (default: 8765)')
+    parser.add_argument('--no-browser', dest='no_browser', action='store_true', help='Do not automatically open browser window')
+    return parser
+
+
 def parseCmdArgs(argv=None):
-    argvReader = ArgvReader(argv or sys.argv)
+    raw_argv = list(argv if argv is not None else sys.argv)
+    tokens = raw_argv[1:]
+
+    # Detect 'batch', 'series', or 'gui' subcommand as first non-flag token (or after --cli)
+    filtered_tokens = []
+    subcommand = None
+    for idx, tok in enumerate(tokens):
+        if subcommand is None and tok in ('batch', 'series', 'gui'):
+            subcommand = tok
+            continue
+        if tok in ('--cli', '-c') and subcommand in ('batch', 'series', 'gui'):
+            continue
+        filtered_tokens.append(tok)
+
+    if subcommand == 'gui':
+        parser = buildGuiParser()
+        try:
+            ns = parser.parse_args(filtered_tokens)
+        except SystemExit:
+            return None
+        if ns.help:
+            parser.print_help()
+            return {'help_printed': True}
+        return {
+            'cli': False,
+            'subcommand': 'gui',
+            'gui_args': {
+                'host': ns.host,
+                'port': ns.port,
+                'open_browser': not ns.no_browser,
+            },
+            'options': {},
+        }
+
+    if subcommand == 'batch':
+        # Strip leading --cli/-c if placed before 'batch'
+        clean_tokens = [t for t in filtered_tokens if t not in ('--cli', '-c')]
+        parser = buildBatchParser()
+        try:
+            ns = parser.parse_args(clean_tokens)
+        except SystemExit:
+            return None
+        if ns.help:
+            parser.print_help()
+            return {'help_printed': True}
+        ref_dir = ns.ref_dir or ns.pos_ref_dir
+        out_pattern = ns.out_pattern
+        if not out_pattern:
+            if getattr(ns, 'jellyfin_default', False):
+                out_pattern = '{ref_dir}/{ref_name}.{lang}.default.srt' if ns.lang else '{ref_dir}/{ref_name}.default.srt'
+            elif getattr(ns, 'jellyfin', False):
+                out_pattern = '{ref_dir}/{ref_name}.{lang}.srt' if ns.lang else '{ref_dir}/{ref_name}.srt'
+            else:
+                out_pattern = '{ref_dir}/{ref_name}.synced.srt'
+        opts = {}
+        if ns.logLevel:
+            opts['logLevel'] = ns.logLevel
+        if ns.logFile:
+            opts['logFile'] = ns.logFile
+        return {
+            'cli': True,
+            'subcommand': 'batch',
+            'batch_args': {
+                'ref_dir': ref_dir,
+                'sub_dir': ns.sub_dir,
+                'ref_pattern': ns.ref_pattern,
+                'sub_pattern': ns.sub_pattern,
+                'out_dir': ns.out_dir,
+                'out_pattern': out_pattern,
+                'in_place': ns.in_place,
+                'backup': ns.backup,
+                'skip_if_exists': ns.skip_if_exists,
+                'matcher_mode': ns.matcher_mode,
+                'lang': ns.lang,
+                'ref_lang': ns.ref_lang,
+                'recursive': ns.recursive,
+                'task_timeout': ns.task_timeout,
+                'continue_on_error': ns.continue_on_error,
+                'dry_run': ns.dry_run,
+                'jobs': ns.jobs,
+                'summary_json': ns.summary_json,
+                'verbose': ns.verbose,
+            },
+            'verbose': ns.verbose,
+            'options': opts,
+        }
+
+    if subcommand == 'series':
+        clean_tokens = [t for t in filtered_tokens if t not in ('--cli', '-c')]
+        parser = buildSeriesParser()
+        try:
+            ns = parser.parse_args(clean_tokens)
+        except SystemExit:
+            return None
+        if ns.help:
+            parser.print_help()
+            return {'help_printed': True}
+        series_dir = ns.series_dir or ns.pos_series_dir
+        out_pattern = ns.out_pattern
+        if not out_pattern:
+            if getattr(ns, 'jellyfin_default', False):
+                out_pattern = '{ref_dir}/{ref_name}.{lang}.default.srt'
+            elif getattr(ns, 'jellyfin', False):
+                out_pattern = '{ref_dir}/{ref_name}.{lang}.srt'
+            else:
+                out_pattern = '{ref_dir}/{ref_name}.{lang}.synced.srt'
+        opts = {}
+        if ns.logLevel:
+            opts['logLevel'] = ns.logLevel
+        if ns.logFile:
+            opts['logFile'] = ns.logFile
+        return {
+            'cli': True,
+            'subcommand': 'series',
+            'series_args': {
+                'series_dir': series_dir,
+                'target_lang': ns.lang,
+                'ref_lang': ns.ref_lang,
+                'provider': ns.provider,
+                'opensubtitles_api_key': ns.opensubtitles_api_key,
+                'out_pattern': out_pattern,
+                'cache_dir': ns.cache_dir,
+                'max_episodes': ns.max_episodes,
+                'episodes_filter': ns.episodes_filter,
+                'season_filter': ns.season_filter,
+                'recursive': ns.recursive,
+                'skip_if_exists': ns.skip_if_exists,
+                'task_timeout': ns.task_timeout,
+                'workers': ns.workers,
+                'dry_run': ns.dry_run,
+                'summary_json': ns.summary_json,
+                'verbose': ns.verbose,
+            },
+            'verbose': ns.verbose,
+            'options': opts,
+        }
+
+    argvReader = ArgvReader(raw_argv)
     try:
         opts = parse(argvReader, options())
         if len(argvReader) > 0:
@@ -13,9 +250,16 @@ def parseCmdArgs(argv=None):
     except Exception as e:
         print(str(e), file=sys.stderr)
 
+
 def printHelp(argv=None):
-    app = (argv or sys.argv or [ 'subsync' ])[0]
-    print(_('Usage: {} [OPTIONS]').format(app))
+    app = (argv or sys.argv or ['subsync'])[0]
+    print(_('Usage: {} [OPTIONS] [COMMAND]').format(app))
+    print('')
+    print('Commands:')
+    print('  gui                 Launch standalone SubSync Studio GUI (see: subsync gui --help)')
+    print('  sync                Synchronize individual subtitle and reference files')
+    print('  batch [DIR]         Unattended batch synchronization across multiple files (see: subsync batch --help)')
+    print('  series [DIR]        Automated series subtitle download & resynchronization (see: subsync series --help)')
 
     def printHelpFor(opts, prefix=''):
         for opt in opts:
@@ -244,4 +488,3 @@ def options():
         { 'group': 'options', 'name': 'dump-words', 'metavar': 'SRC[:PATH]', 'parser': parseWordsDump, 'multiple': True },
         { 'group': 'options', 'name': 'test', 'parser': parseConst },
 ]
-

@@ -3,12 +3,53 @@
 This is an automatic movie subtitle synchronization library.
 """
 
-import gizmo
+import os
+import shutil
+import sys
+import types
+
+# 1. Ensure subsync/config.py exists on clean git checkouts and auto-wire .ai_env
+_pkg_dir = os.path.dirname(os.path.abspath(__file__))
+_repo_root = os.path.dirname(_pkg_dir)
+for _ai_env_cand in (os.path.join(_repo_root, '.ai_env'), '/home/juliench/subsync/.ai_env'):
+    if os.path.isdir(_ai_env_cand) and _ai_env_cand not in sys.path:
+        sys.path.insert(0, _ai_env_cand)
+
+_cfg_path = os.path.join(_pkg_dir, 'config.py')
+_cfg_tmpl = os.path.join(_pkg_dir, 'config.py.template')
+if not os.path.isfile(_cfg_path) and os.path.isfile(_cfg_tmpl):
+    try:
+        shutil.copyfile(_cfg_tmpl, _cfg_path)
+    except OSError:
+        pass
+
+# 2. Ensure pysubs2 is available (falls back to pure-Python compat_pysubs2)
+from . import compat_pysubs2
+compat_pysubs2.register_as_pysubs2()
+
+# 3. Bootstrap gizmo in sys.modules before importing submodules to prevent circular imports
+if 'gizmo' not in sys.modules:
+    try:
+        import gizmo
+    except ImportError:
+        _shim = types.ModuleType('gizmo')
+        _shim._IS_PYTHON_SHIM = True
+        _shim.Error = type('Error', (Exception,), {})
+        _shim.ErrorTerminated = type('ErrorTerminated', (_shim.Error,), {})
+        _shim.setDebugLevel = lambda level: None
+        sys.modules['gizmo'] = _shim
+        import gizmo
+
+from .synchro import modern_engine
+gizmo = modern_engine.install_gizmo_shim()
+
 from .synchro import SyncController, SyncTask, InputFile, SubFile, RefFile, OutputFile
+from .synchro.modern_engine import synchronize_pair, SyncResult
 from .assets import assetManager, AssetList
 
 __all__ = [
-        'synchronize', 'version', 'subsync',
+        'synchronize', 'synchronize_pair', 'SyncResult',
+        'version', 'subsync',
         'SyncController', 'SyncTask',
         'InputFile', 'SubFile', 'RefFile', 'OutputFile',
         'assetManager', 'AssetList',
@@ -26,47 +67,6 @@ def synchronize(sub, ref, out, *, onError=None, options={}, offline=False, updat
 
     This is simplified high level synchronization API. For finer-grained
     control use `SyncController` object.
-
-    Parameters
-    ----------
-    sub: SubFile or InputFile or dict
-        Input subtitle description, proper object instance or `dict` with
-        fields same as arguments to `InputFile` constructor.
-    ref: RefFile or InputFile or dict
-        Reference description, proper object instance or `dict` with fields
-        same as arguments to `InputFile` constructor.
-    out: OutputFile or dict
-        Output subtitle description, proper object instance or `dict` with
-        fields same as arguments to `OutputFile` constructor.
-    onError: callable, optional
-        Error callback for non-terminal errors. Terminal errors will raise
-        exception. For details see `SyncController` constructor.
-    options: dict, optional
-        Override default synchronization options, see `SyncController.configure`.
-    offline: bool, optional
-        Prevent any communication with asset server. If required assets are
-        missing, they will not be downloaded and synchronization will fail.
-    updateAssets: bool, optional
-        Whether to update existing assets if update is available online. Has no
-        effect with `offline`=`True`.
-
-    Returns
-    -------
-    tuple of (subsync.synchro.controller.SyncJobResult, subsync.synchro.controller.SyncStatus)
-        Synchronization result.
-
-    Notes
-    -----
-    This function runs synchronously - it will block until synchronization
-    finishes. For non-blocking synchronization use `SyncController` instead.
-
-    Example
-    -------
-    >>> sub = { 'path': './sub.srt', 'lang': 'rus' }
-    >>> ref = { 'path': './movie.avi', 'stream': 2, 'lang': 'eng' }
-    >>> out = { 'path': './out.srt' }
-    >>> subsync.synchronize(sub, ref, out)
-    (SyncJobResult(success=True, terminated=False, path='out.srt'), SyncStatus(correlated=True, maxChange=0.010168457031248579, progress=0.5212266710947953, factor=0.9999998222916713, points=289, formula=1.0000x+0.010, effort=0.5004523633099243))
     """
     task = SyncTask(sub, ref, out)
     assets = assetManager().getAssetsForTasks([ task ])
@@ -115,33 +115,15 @@ def synchronize(sub, ref, out, *, onError=None, options={}, offline=False, updat
 
 
 def version():
-    """Get subsync version.
-
-    Returns
-    -------
-    tuple of str
-        Tuple of two strings (short, long):
-
-        - short - numbers separated by dot in format `major.minor` or `major.minor.revision`;
-        - long - descriptive string.
-
-    Example
-    -------
-    >>> subsync.version()
-    ('0.15.34', '0.15-34-g5aa31da')
-    """
+    """Get subsync version."""
     try:
         from .version import version, version_short
         return version_short, version
     except:
-        return None, 'UNDEFINED'
+        return '0.17.0', '0.17.0'
 
 
-def subsync(argv):
-    """Run subsync with list of command line arguments.
-
-    .. deprecated:: 0.16.0
-    Use either `synchronize` or `SyncController` instead.
-    """
+def subsync(argv=None):
+    """Run subsync with list of command line arguments."""
     from .__main__ import subsync
     return subsync(argv)
