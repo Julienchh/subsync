@@ -8,9 +8,10 @@ logger = logging.getLogger(__name__)
 
 def detectEncoding(path, lang, probeSize=32*1024):
     try:
-        dlang, denc = locale.getdefaultlocale()
+        dlang = locale.getlocale()[0]
+        denc = locale.getencoding() if hasattr(locale, 'getencoding') else locale.getpreferredencoding(False)
     except Exception as e:
-        logger.warn('getdefaultlocale failed, %r', e)
+        logger.warning('getlocale failed, %r', e)
         dlang, denc = None, None
 
     if not lang and dlang:

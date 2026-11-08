@@ -35,3 +35,6 @@ CppCheckResults.xml
 .eggs
 *.egg-info
 *.snap
+__pycache__/
+/.ai_env/
+/.ai_models/

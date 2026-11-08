@@ -1,13 +1,17 @@
-import gizmo
-from subsync import subtitle
-from subsync.synchro import pipeline, dictionary, encdetect, wordsdump, controller
 import threading
-
 import logging
+
+from subsync import subtitle
+from subsync.synchro import aligner, controller, encdetect, modern_engine, vad
+
+gizmo = modern_engine.install_gizmo_shim()
+
 logger = logging.getLogger(__name__)
 
 
 class Synchronizer(object):
+    """Subtitle-to-reference synchronizer powered by the modern VAD + FFT/OLS alignment engine."""
+
     def __init__(self, sub, ref):
         self.sub = sub
         self.ref = ref
@@ -19,6 +23,15 @@ class Synchronizer(object):
         self.effortBegin = None
         self.statsLock = threading.Lock()
 
+        self.subtitlesCollector = subtitle.SubtitlesCollector()
+        self.options = {}
+        self._runCb = None
+        self._worker = None
+        self._running = False
+        self._progress = 0.0
+        self._stop_requested = False
+
+        # Legacy attributes kept for API compatibility
         self.correlator = None
         self.translator = None
         self.subPipeline = None
@@ -28,202 +41,196 @@ class Synchronizer(object):
 
     def destroy(self):
         logger.info('releasing synchronizer resources')
-
-        if self.correlator:
-            self.correlator.stop(force=True)
-
-        for p in self.pipelines:
-            p.stop()
-
-        for p in self.pipelines:
-            p.destroy()
-
-        if self.correlator:
-            self.correlator.wait()
-            self.correlator.connectStatsCallback(None)
-
+        self.stop(force=True)
         self.subPipeline = None
         self.refPipelines = []
         self.pipelines = []
         self.translator = None
-        self.dictionary = None
-        self.refWordsSink = None
 
-        for wd in self.wordsDumpers:
-            wd.flush()
-
-        self.wordsDumpers = []
-
-    def init(self, options, runCb=None):
-        try:
-            self._initInternal(options, runCb)
-        except gizmo.ErrorTerminated:
-            logger.info('initialization terminated')
-
-    def _initInternal(self, options, runCb=None):
+    def init(self, options=None, runCb=None):
         logger.info('initializing synchronization jobs')
+        self.options = dict(options or {})
+        self._runCb = runCb
+        self._stop_requested = False
+        self._progress = 0.0
+
         for stream in (self.sub, self.ref):
-            if stream.type == 'subtitle/text' and not stream.enc and len(stream.streams) == 1:
-                stream.enc = encdetect.detectEncoding(stream.path, stream.lang)
+            if stream and stream.type == 'subtitle/text' and not stream.enc and len(stream.streams) <= 1:
+                try:
+                    stream.enc = encdetect.detectEncoding(stream.path, stream.lang)
+                except Exception as err:
+                    logger.debug('encoding detection fallback for %s: %r', stream.path, err)
+                    stream.enc = 'UTF-8'
 
-        self.correlator = gizmo.Correlator(
-                options['windowSize'],
-                options['minCorrelation'],
-                options['maxPointDist'],
-                options['minPointsNo'],
-                options['minWordsSim'])
-        self.correlator.connectStatsCallback(self.onStatsUpdate)
-        self.refWordsSink = self.correlator.pushRefWord
-        self.subtitlesCollector = subtitle.SubtitlesCollector()
-
-        self.subPipeline = pipeline.createProducerPipeline(self.sub)
-        self.subPipeline.connectEosCallback(self.onSubEos)
-        self.subPipeline.connectErrorCallback(self.onSubError)
-        self.subPipeline.addSubsListener(self.subtitlesCollector.addSubtitle)
-        self.subPipeline.addSubsListener(self.correlator.pushSubtitle)
-        self.subPipeline.addWordsListener(self.correlator.pushSubWord)
-
-        if self.sub.lang and self.ref.lang and self.sub.lang != self.ref.lang:
-            self.dictionary = dictionary.loadDictionary(self.ref.lang, self.sub.lang, options['minWordLen'])
-            self.translator = gizmo.Translator(self.dictionary)
-            self.translator.setMinWordsSim(options['minWordsSim'])
-            self.translator.addWordsListener(self.correlator.pushRefWord)
-            self.refWordsSink = self.translator.pushWord
-
-        self.refPipelines = pipeline.createProducerPipelines(self.ref, no=options['jobsNo'], runCb=runCb)
-
-        for p in self.refPipelines:
-            p.connectEosCallback(self.onRefEos)
-            p.connectErrorCallback(self.onRefError)
-            p.addWordsListener(self.refWordsSink)
-
-        self.pipelines = [ self.subPipeline ] + self.refPipelines
-
-        for p in self.pipelines:
-            p.configure(
-                    minWordLen=options['minWordLen'],
-                    minWordProb=options['minWordProb'])
-
-        dumpSources = {
-                'sub':     [ self.subPipeline ],
-                'subPipe': [ self.subPipeline ],
-                'subRaw':  [ self.subPipeline.getRawWordsSource() ],
-                'ref':     [ self.translator ] if self.translator else self.refPipelines,
-                'refPipe': self.refPipelines,
-                'refRaw':  [ p.getRawWordsSource() for p in self.refPipelines ],
-                }
-
-        for srcId, path in options.get('dumpWords', []):
-            sources = dumpSources.get(srcId)
-            if sources:
-                logger.debug('dumping %s to %s (from %i sources)', srcId, path, len(sources))
-                if path:
-                    wd = wordsdump.WordsFileDump(path, overwrite=True)
-                else:
-                    wd = wordsdump.WordsStdoutDump(srcId)
-                self.wordsDumpers.append(wd)
-                for source in sources:
-                    source.addWordsListener(wd.pushWord)
+        try:
+            loaded_subs = modern_engine.load_subtitles_from_source(
+                self.sub.path,
+                stream_index=self.sub.no,
+                encoding=self.sub.enc,
+                lang=self.sub.lang,
+                fps=self.sub.fps,
+            )
+            self.subtitlesCollector.setSubtitles(loaded_subs)
+        except Exception as err:
+            self.onSubError(err)
+            raise
 
     def start(self):
         logger.info('starting synchronization')
-        self.correlator.start('Correlator')
-        for id, p in enumerate(self.pipelines):
-            p.start('Pipeline{}'.format(id))
+        self._running = True
+        self._worker = threading.Thread(
+            target=self._runAlignmentWorker,
+            name='ModernSynchronizer',
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _runAlignmentWorker(self):
+        try:
+            if self._stop_requested or (self._runCb and not self._runCb()):
+                return
+
+            with self.statsLock:
+                self._progress = 0.2
+
+            sub_obj = self.subtitlesCollector.getSubtitles()
+            sub_intervals = vad.subtitles_to_intervals(sub_obj)
+            if not sub_intervals:
+                raise RuntimeError(f"No subtitle events found in {self.sub.path!r}")
+
+            if self._stop_requested or (self._runCb and not self._runCb()):
+                return
+
+            try:
+                ref_envelope, ref_intervals = vad.extract_speech_envelope(
+                    self.ref.path,
+                    stream_index=self.ref.no,
+                    stream_type=self.ref.type,
+                    encoding=self.ref.enc or 'utf-8',
+                    fps=self.ref.fps,
+                    frame_hz=vad.FRAME_HZ,
+                )
+            except Exception as err:
+                self.onRefError(err)
+                return
+
+            if self._stop_requested or (self._runCb and not self._runCb()):
+                return
+
+            with self.statsLock:
+                self._progress = 0.7
+
+            window_size = float(self.options.get('windowSize', 1800.0) or 1800.0)
+            allow_drift = bool(self.options.get('allowDrift', True))
+
+            align_res = aligner.align_intervals_and_envelopes(
+                sub_intervals=sub_intervals,
+                ref_envelope=ref_envelope,
+                ref_intervals=ref_intervals,
+                frame_hz=vad.FRAME_HZ,
+                max_offset_s=window_size,
+                allow_drift=allow_drift,
+            )
+
+            new_stats = gizmo.CorrelationStats(
+                correlated=align_res.correlated,
+                factor=align_res.factor,
+                points=align_res.points,
+                maxDistance=align_res.max_distance,
+                formula=align_res.formula,
+            )
+
+            with self.statsLock:
+                self._ref_envelope = ref_envelope
+                self._ref_intervals = ref_intervals
+                self.stats = new_stats
+                self.effortBegin = 0.0
+                self._progress = 1.0
+
+        except Exception as err:
+            logger.warning('alignment worker error: %r', err, exc_info=True)
+            self.onError('core', err)
+        finally:
+            with self.statsLock:
+                self._running = False
+                self._progress = 1.0
+            try:
+                self.onUpdate()
+            except Exception:
+                pass
 
     def stop(self, force=True):
         logger.info('stopping synchronizer')
-        self.correlator.stop(force=force)
-
-        for p in self.pipelines:
-            p.stop()
+        self._stop_requested = True
+        worker = self._worker
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=5.0)
+        with self.statsLock:
+            self._running = False
 
     def isRunning(self):
-        if self.correlator and self.correlator.isRunning():
-            return True
-
-        for p in self.pipelines:
-            if p.isRunning():
-                return True
-
-        return False
+        with self.statsLock:
+            return self._running
 
     def getProgress(self):
-        psum = 0.0
-        plen = 0
-
-        for pr in  [ p.getProgress() for p in self.pipelines ]:
-            if pr != None:
-                psum += pr
-                plen += 1
-
-        if self.correlator:
-            cp = self.correlator.getProgress()
-            res = cp * cp
-        else:
-            res = 0.0
-
-        if plen > 0:
-            res *= psum / plen
-
-        if res < 0: res = 0
-        if res > 1: res = 1
-        return res
+        with self.statsLock:
+            return max(0.0, min(1.0, self._progress))
 
     def getStatus(self):
         with self.statsLock:
             stats = self.stats
-            progress = self.getProgress()
+            progress = max(0.0, min(1.0, self._progress))
             begin = self.effortBegin
+            running = self._running
 
-        effort = -1
-        if begin is not None and begin < 1.0:
-            if progress <= 0.0:
-                effort = 0.0
-            elif progress >= 1.0:
+        effort = -1.0
+        if begin is not None:
+            if progress >= 1.0 or not running:
                 effort = 1.0
+            elif progress <= begin:
+                effort = 0.0
             else:
-                effort = (progress - begin) / (1.0 - begin)
+                effort = (progress - begin) / max(1e-6, 1.0 - begin)
 
         return controller.SyncStatus(
-                correlated  = stats.correlated and self.subPipeline and not self.subPipeline.isRunning(),
-                maxChange   = self.subtitlesCollector.getMaxSubtitleDiff(stats.formula),
-                progress    = progress,
-                factor      = stats.factor,
-                points      = stats.points,
-                formula     = stats.formula,
-                effort      = effort)
+            correlated=bool(stats.correlated and not running),
+            maxChange=self.subtitlesCollector.getMaxSubtitleDiff(stats.formula),
+            progress=progress,
+            factor=stats.factor,
+            points=stats.points,
+            formula=stats.formula,
+            effort=effort,
+            maxDistance=getattr(stats, 'maxDistance', 0.0),
+        )
 
     def getSynchronizedSubtitles(self):
         with self.statsLock:
             formula = self.stats.formula
-        return self.subtitlesCollector.getSynchronizedSubtitles(formula)
+            ref_env = getattr(self, '_ref_envelope', None)
+            ref_ivs = getattr(self, '_ref_intervals', None)
+        synced = self.subtitlesCollector.getSynchronizedSubtitles(formula)
+        if ref_env and len(ref_env) >= int(300.0 * vad.FRAME_HZ):
+            try:
+                synced.verify_and_heal_with_vad(
+                    ref_env,
+                    ref_intervals=ref_ivs,
+                    frame_hz=vad.FRAME_HZ,
+                )
+            except Exception as err:
+                logger.debug('verification & self-healing skipped: %r', err)
+            try:
+                synced.refine_durations_with_vad(
+                    ref_env,
+                    ref_intervals=ref_ivs,
+                    frame_hz=vad.FRAME_HZ,
+                )
+            except Exception as err:
+                logger.debug('duration refinement skipped: %r', err)
+        return synced
 
     def onStatsUpdate(self, stats):
-        logger.debug(stats)
         with self.statsLock:
             self.stats = stats
-            if self.effortBegin == None and stats.correlated and self.subPipeline and not self.subPipeline.isRunning():
-                self.effortBegin = self.getProgress()
-        self.onUpdate()
-
-    def onSubEos(self):
-        logger.info('subtitles read done')
-        self.checkIfAllPipelinesDone()
-        with self.statsLock:
-            if self.effortBegin == None and self.stats.correlated:
-                self.effortBegin = self.getProgress()
-
-    def onRefEos(self):
-        logger.info('references read done')
-        self.checkIfAllPipelinesDone()
-
-    def checkIfAllPipelinesDone(self):
-        for p in self.pipelines:
-            if p.isRunning():
-                return
-        logger.info('stopping correlator')
-        self.correlator.stop(force=False)
         self.onUpdate()
 
     def onSubError(self, err):

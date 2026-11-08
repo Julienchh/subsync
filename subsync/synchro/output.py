@@ -17,38 +17,6 @@ class OutputFile(object):
     """Subtitle target description - specifies where output should be saved."""
 
     def __init__(self, path=None, *, enc=None, fps=None):
-        """
-        Parameters
-        ----------
-        path: str
-            Output path or pattern. Path could be literal or may contain
-            following variables:
-
-              - `{sub_path}`/`{ref_path}` - subtitle/reference full path;
-              - `{sub_no}`/`{ref_no}` - stream number;
-              - `{sub_lang}`/`{ref_lang}` - 3-letter language code;
-              - `{sub_lang2}`/`{ref_lang2}` - 2-letter language code;
-              - `{sub_name}`/`{ref_name}` - file name (without path and extension);
-              - `{sub_dir}`/`{ref_dir}` - directory path;
-              - `{if:<field>:<value>}` - if field is set, append value;
-              - `{if_not:<field>:<value>}` - if field is not set, append value.
-
-        enc: str, optional
-            Character encoding, default is 'UTF-8'.
-        fps: float, optional
-            Framerate, applies only for frame-based subtitles.
-
-        Notes
-        -----
-        Subtitle format is derived from file extension, thus path must end with
-        one of the supported extensions.
-
-        Examples
-        --------
-        `{ref_dir}/{ref_name}{if:sub_lang:.}{sub_lang}.srt`
-
-        `{sub_dir}/{sub_name}-out.ssa`
-        """
         self.path = path
         self.enc  = enc or 'UTF-8'
         self.fps  = fps
@@ -104,8 +72,9 @@ class PathFormatter(object):
         else:
             self.d = {}
             for prefix, item in [ ('sub_', sub), ('ref_', ref) ]:
+                no_val = item.no if item.no is not None else 0
                 self.d[ prefix + 'path' ] = item.path
-                self.d[ prefix + 'no'   ] = str(item.no + 1)
+                self.d[ prefix + 'no'   ] = str(no_val + 1)
                 self.d[ prefix + 'lang' ] = item.lang or ''
                 self.d[ prefix + 'lang2' ] = languages.get(code3=item.lang).code2 or ''
                 self.d[ prefix + 'name' ] = os.path.splitext(os.path.basename(item.path))[0]
@@ -114,6 +83,7 @@ class PathFormatter(object):
         path = _formatPattern(pattern, self.d)
         self.cache = (cacheKey, pattern, path)
         return path
+
 
 def validatePattern(pattern):
     """Raise exception for invalid path pattern."""

@@ -1,4 +1,6 @@
-import gizmo
+from subsync.synchro import modern_engine
+gizmo = modern_engine.install_gizmo_shim()
+
 from subsync.synchro.channels import ChannelsMap
 from subsync.data import languages
 from subsync.translations import _
@@ -14,33 +16,6 @@ class InputFile(object):
 
     def __init__(self, path=None, stream=None, *, streamByType=None,
             streamByLang=None, lang=None, enc=None, fps=None, channels=None):
-        """
-        Parameters
-        ----------
-        path: str
-            Input file path.
-        stream: int, optional
-            Stream number, 1-based.
-        streamByType: str, optional
-            Select stream by type ('sub' or 'audio').
-        streamByLang: str, optional
-            Select stream by 3-letter language code, relies of file metadata.
-        lang: str, optional
-            Stream language as 2- or 3-letter ISO code.
-        enc: str, optional
-            Character encoding, `None` for auto detection based by `lang`.
-        fps: float, optional
-            Framerate.
-        channels: str or subsync.synchro.channels.ChannelsMap, optional
-            Audio channels to listen to, could be 'auto' or `None` for auto
-            selection, 'all' to listen to all channels, or comma separated
-            channels abbreviation, e.g. 'FL,FR'.
-
-        Notes
-        -----
-        Here stream number is 1-based (first stream in file has number 1) but
-        other methods expects 0-based numbers.
-        """
         self.path    = path
         self.no      = None
         self.type    = None
@@ -74,7 +49,7 @@ class InputFile(object):
     def __lt__(self, other):
         if self.path != other.path:
             return self.path < other.path
-        return self.no < other.no
+        return (self.no or 0) < (other.no or 0)
 
     def stream(self):
         """Return selected stream."""
@@ -121,12 +96,14 @@ class InputFile(object):
 
     def selectBy(self, type=None, lang=None):
         """Select stream by type and language (or only one of them)."""
+        norm_lang = (languages.get(lang).code3 or lang or '').lower() if lang else None
         for s in self.streams.values():
             if self.types and s.type not in self.types:
                 continue
             if type and not s.type.startswith(type):
                 continue
-            if lang and lang != s.lang.lower():
+            s_lang = (languages.get(s.lang).code3 or s.lang or '').lower()
+            if norm_lang and norm_lang != s_lang and lang.lower() != (s.lang or '').lower():
                 continue
             return self.select(s.no)
         raise Error(_('There is no matching stream in {}').format(self.path)) \
@@ -216,23 +193,8 @@ class RefFile(InputFile):
 
 
 def getLangFromPath(path):
-    """Get language code from file name.
-
-    Reads 2- or 3-letter language code from file name, if code is present as
-    last thing before file extension.
-
-    Returns
-    -------
-    str
-        3-letter language code or `None` if code is not present.
-
-    Examples
-    --------
-    - `subtitles.eng.srt` - eng
-    - `subtitles-fr.srt` - fre
-    """
-
-    name = path.rsplit('.', 1)[0]
+    """Get language code from file name."""
+    name = os.path.basename(path).rsplit('.', 1)[0]
     size = 0
 
     for c in reversed(name):
@@ -243,3 +205,6 @@ def getLangFromPath(path):
 
     if size == 2 or size == 3:
         return languages.get(name[-size:].lower()).code3
+
+
+import os

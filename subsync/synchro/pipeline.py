@@ -1,4 +1,6 @@
-import gizmo
+from subsync.synchro import modern_engine
+gizmo = modern_engine.install_gizmo_shim()
+
 from subsync.synchro import speech
 from subsync.data import languages
 from subsync.translations import _
@@ -61,11 +63,6 @@ class BasePipeline(object):
 
 class SubtitlePipeline(BasePipeline):
     def __init__(self, stream, runCb=None):
-        ''' Speech recognition pipeline:
-
-        Demux --> SpeechDec --[words]--> {NgramSplitter} --[words]--> ...
-        '''
-
         super().__init__(stream, runCb)
         self.dec = gizmo.SubtitleDec()
         self.ngramSplitter = None
@@ -117,30 +114,12 @@ class SubtitlePipeline(BasePipeline):
 
 class SpeechPipeline(BasePipeline):
     def __init__(self, stream, runCb=None):
-        ''' Speech recognition pipeline:
-
-        Demux --> AudioDec --> Resampler --> SpeechRecognition --[words]--> {NgramSplitter} --[words]--> ...
-        '''
-
         super().__init__(stream, runCb)
 
-        speechModel = speech.loadSpeechModel(stream.lang)
         self.dec = gizmo.AudioDec()
-
-        speechAudioFormat = speech.getSpeechAudioFormat(speechModel)
-        logger.info('speech recognition audio format: %s', speechAudioFormat)
-
-        self.speechRec = speech.createSpeechRec(speechModel)
+        self.speechRec = gizmo.SpeechRecognition()
         self.ngramSplitter = None
         self.sink = self.speechRec
-
-        langInfo = stream.lang and languages.get(code3=stream.lang.lower())
-        if langInfo and langInfo.ngrams:
-            logger.info('switching to %i-gram for audio "%s"', langInfo.ngrams, stream.path)
-            self.speechRec.setMinWordLen(langInfo.ngrams)
-            self.ngramSplitter = gizmo.NgramSplitter(langInfo.ngrams)
-            self.speechRec.addWordsListener(self.ngramSplitter.pushWord)
-            self.sink = self.ngramSplitter
 
         self.resampler = gizmo.Resampler()
         self.channels = stream.channels
@@ -148,7 +127,6 @@ class SpeechPipeline(BasePipeline):
 
         self.demux.connectDec(self.dec, stream.no)
         self.dec.connectOutput(self.resampler)
-        self.resampler.connectOutput(self.speechRec, speechAudioFormat)
 
     def configure(self, minWordLen, minWordProb):
         self.speechRec.setMinWordProb(minWordProb)
@@ -187,6 +165,7 @@ def createProducerPipeline(stream, runCb=None):
 
 
 def createProducerPipelines(stream, no=None, runCb=None):
+    no = no or 1
     pipes = []
     for i in range(no):
         p = createProducerPipeline(stream, runCb)
@@ -206,7 +185,7 @@ def createProducerPipelines(stream, no=None, runCb=None):
         partTime = duration / no
         for i, p in enumerate(pipes):
             begin = i * partTime
-            end = begin + partTime + 1.0 # overlap to catch whole words
+            end = begin + partTime + 1.0
             if end >= duration:
                 end = math.inf
             logger.info('job %i/%i time window set to %.2f - %.2f', i+1, no, begin, end)

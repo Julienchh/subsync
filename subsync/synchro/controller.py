@@ -32,7 +32,7 @@ SyncJobResult = namedtuple('SyncJobResult', [
 SyncJobResult.__doc__ = """Result of single synchronization task."""
 
 
-SyncStatus = namedtuple('SyncStatus', [
+_SyncStatusTuple = namedtuple('SyncStatus', [
     'correlated',
     'maxChange',
     'progress',
@@ -41,14 +41,36 @@ SyncStatus = namedtuple('SyncStatus', [
     'formula',
     'effort',
 ])
-SyncStatus.__doc__ = """Synchronization status.
 
-Notes
------
-`correlated` set to `True` does not necessary mean that correlation is done -
-we could yet get better fix.
-In interactive mode, subtitles could be saved when `correlated` is set.
-"""
+
+class SyncStatus(_SyncStatusTuple):
+    """Synchronization status."""
+
+    def __new__(cls, correlated=False, maxChange=0.0, progress=0.0, factor=0.0,
+                points=0, formula=None, effort=-1.0, maxDistance=0.0):
+        if formula is None:
+            from subsync.synchro.aligner import FormulaLine
+            formula = FormulaLine(1.0, 0.0)
+        obj = super().__new__(
+            cls,
+            bool(correlated),
+            float(maxChange),
+            float(progress),
+            float(factor),
+            int(points),
+            formula,
+            float(effort),
+        )
+        obj.maxDistance = float(maxDistance)
+        return obj
+
+    @property
+    def offset_s(self):
+        return float(getattr(self.formula, 'b', 0.0))
+
+    @property
+    def speed_factor(self):
+        return float(getattr(self.formula, 'a', 1.0))
 
 
 class SyncController(object):
@@ -60,38 +82,6 @@ class SyncController(object):
     """
 
     def __init__(self, listener=None, **kw):
-        """
-        Parameters
-        ----------
-        listener: object, optional
-            Object with methods named as following callback parameters.
-        onJobStart: callable(task), optional
-            Called when the task synchronization starts.
-        onJobEnd: callable(task, status, result), optional
-            Called when the task synchronization ends.
-        onJobUpdate: callable(task, status), optional
-            Called periodically during synchronization to report current state.
-        onFinish: callable(terminated), optional
-            Called when synchronizer ends its work - either all tasks are
-            processed or synchronization was terminated;
-        onError: callable(task, source, error), optional
-            Called to report non-terminal errors. Non-terminal errors are errors
-            not causing synchronizer to stop, but could impact results, e.g. audio
-            decoding errors.
-
-        Notes
-        -----
-        Callbacks arguments:
-
-        - task : `subsync.synchro.SyncTask` - object passed to
-            `SyncController.synchronize`;
-        - status : `SyncStatus` - object reflecting current synchronization state;
-        - result : `SyncJobResult`;
-        - terminated : `bool` - whether synchronization was terminated;
-        - source : `str` - error source, could be 'sub' or 'ref' for
-            subtitle/reference extractor or 'core';
-        - error - exception instance.
-        """
         self._onJobStart = kw.get('onJobStart', getattr(listener, 'onJobStart', lambda task: None))
         self._onJobInit = kw.get('onJobInit', getattr(listener, 'onJobInit', lambda task: None))
         self._onJobEnd = kw.get('onJobEnd', getattr(listener, 'onJobEnd', lambda task, status, result: None))
@@ -106,78 +96,22 @@ class SyncController(object):
         self._terminated = False
 
     def configure(self, **kw):
-        """Override default synchronization options.
-
-        Parameters
-        ----------
-        maxPointDist: float, optional
-            Maximum acceptable synchronization error, in seconds (default 2).
-        minPointsNo: int, optional
-            Minimum synchronization points no (default 20).
-        outputCharEnc: str or None, optional
-            Output character encoding, `None` for the same encoding as input
-            subtitles (default 'UTF-8').
-        windowSize: float, optional
-            Synchronization window, in seconds. Timestamps will be corrected
-            no more than this value (default 1800).
-        minWordProb: float, optional
-            Minimum speech recognition score, between 0 and 1 (default 0.3).
-        jobsNo: int or None, optional
-            Number of concurent synchronization threads, `None` for auto
-            (default `None`).
-        minWordLen: int, optional
-            Minumum word length, in letters. Shorter words will not be used as
-            synchronization points (default 5).
-        minCorrelation: float, optional
-            Minimum correlation factor, between 0 and 1 (default 0.9999).
-        minWordsSim: float, optional
-            Minimum words similarity to be used as synchronization points,
-            between 0 and 1 (default 0.6).
-        minEffort: float, optional
-            Controls when synchronization should be stopped, between 0 and
-            1 (default 0.5).
-        outTimeOffset: float, optional
-            Add constant offset to output subtitles, in seconds (default 0).
-        overwrite: bool, optional
-            Whether to overwrite existing output files. If not set, output file
-            name will be suffixed with number if needed, to avoid overwritting
-            (default `False`).
-        """
+        """Override default synchronization options."""
         for key, val in kw.items():
-            if key not in self._options:
+            if key not in self._options and key not in ('allowDrift',):
                 raise TypeError("Unexpected keyword argument '{}'".format(key))
             self._options[key] = val
 
     def synchronize(self, tasks, *, timeout=None, interactive=False):
-        """Start task[s] synchronization.
-
-        Parameters
-        ----------
-        tasks: SyncTask or iterable of SyncTask
-            Single or several synchronization tasks.
-        timeout: float or None, optional
-            How often to call `onJobUpdate` callback, in seconds (if
-            registered). `None` to not call it at all.
-        interactive: bool, optional
-            In interactive, tasks subtitles are not saved automatically
-            (`minEffort` and task `out` field are ignored) and user is expected
-            to save it manually either with `saveSynchronizedSubtitles` or
-            `getSynchronizedSubtitles`.
-
-        Notes
-        -----
-        Synchronization status changes are notified with callbacks registered
-        in constructor.
-        `onFinish` is called only when `tasks` is iterable (as oposed to single
-        `SyncTask` object).
-        """
+        """Start task[s] synchronization."""
         if self.isRunning():
             raise RuntimeError('Another synchronization in progress')
 
         logger.debug('synchronization options: %s', self._options)
 
         self._terminated = False
-        if isinstance(tasks, Iterable):
+        if isinstance(tasks, Iterable) and not isinstance(tasks, (str, bytes, dict)):
+            tasks = list(tasks)
             for task in tasks:
                 self.validateTask(task, interactive=interactive)
 
@@ -194,54 +128,27 @@ class SyncController(object):
         self._thread.start()
 
     def terminate(self):
-        """Terminate running synchronization.
-
-        Does nothing if synchronization is not running.
-        """
+        """Terminate running synchronization."""
         if self.isRunning():
             self._terminated = True
             self._semaphore.release()
 
     def isRunning(self):
-        """Check if synchronization is running.
-
-        Returns
-        -------
-        bool
-        """
-        return self._thread and self._thread.is_alive()
+        """Check if synchronization is running."""
+        return bool(self._thread and self._thread.is_alive())
 
     def wait(self):
-        """Block until synchronization ends.
-
-        Returns
-        -------
-        bool
-            `True` if synchronization finished (either successfully or not),
-            `False` if it was terminated with `SyncController.terminate`.
-        """
+        """Block until synchronization ends."""
         if self._thread:
             self._thread.join()
         return not self._terminated
 
     def getStatus(self):
-        """Return current synchronization status.
-
-        Returns
-        -------
-        SyncStatus or None
-        """
+        """Return current synchronization status."""
         return self._sync and self._sync.getStatus()
 
     def getProgress(self):
-        """Return synchronization progress.
-
-        Returns
-        -------
-        float or None
-            Progress of currently processed `SyncTask`, between 0 and 1.
-            `None` if no task was run.
-        """
+        """Return synchronization progress."""
         return self._sync and self._sync.getProgress()
 
     def getSynchronizedSubtitles(self):
@@ -250,21 +157,7 @@ class SyncController(object):
         return self._sync.getSynchronizedSubtitles()
 
     def saveSynchronizedSubtitles(self, path=None, task=None):
-        """Save synchronized subtitles.
-
-        Parameters
-        ----------
-        path: str, optional
-            Path to output subtitles.
-        task: SyncTask, optional
-            `out` field of task will be used as output description.
-
-        Notes
-        -----
-        At least one parameter must be set. Subtitles will be saved in `path` or
-        in `task`.out.path if `path` is not set. `task`.out character encoding
-        and framerate will be used, if set.
-        """
+        """Save synchronized subtitles."""
         if not path and not task:
             raise RuntimeError('At least one of the following arguments must be set: path or task')
 
@@ -284,22 +177,7 @@ class SyncController(object):
                 overwrite=self._options.get('overwrite'))
 
     def validateTask(self, task, *, interactive=False):
-        """Check if task is properly defined.
-
-        Parameters
-        ----------
-        task: SyncTask
-            Task to validate.
-        interactive: bool, optional
-            For interactive synchronization `out` will not be vaildated.
-
-        Raises
-        ------
-        Error
-            Invalid task.
-        KeyError or Exception
-            Invalid `task`.out.path pattern.
-        """
+        """Check if task is properly defined."""
         sub, ref, out = task.sub, task.ref, task.out
         if sub is None or not sub.path or sub.no is None:
             raise Error('subtitles not set', task=task)
@@ -328,6 +206,7 @@ class SyncController(object):
             self._onFinish(self._terminated)
 
     def _runTask(self, task, timeout, interactive):
+        sync = None
         try:
             from .synchronizer import Synchronizer
             self._onJobStart(task)
@@ -361,11 +240,16 @@ class SyncController(object):
             logger.warning('%r', err, exc_info=True)
             self._onError(task, 'core', err)
 
+        if sync is None:
+            return
+
         try:
             sync.stop(force=True)
             status = sync.getStatus()
+            if timeout is not None and status is not None:
+                self._onJobUpdate(task, status)
             logger.info('result: %r', status)
-            succeeded = not self._terminated and status and status.correlated
+            succeeded = bool(not self._terminated and status and status.correlated)
             path = None
 
             if not interactive and succeeded and task.out:

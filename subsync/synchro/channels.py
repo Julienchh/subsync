@@ -1,4 +1,6 @@
-import gizmo
+from subsync.synchro import modern_engine
+gizmo = modern_engine.install_gizmo_shim()
+
 from subsync.translations import _
 
 
@@ -100,7 +102,7 @@ class CustomChannelsMap(ChannelsMap):
         return CustomChannelsMap(intersection)
 
     def getMap(self):
-        gain = 1.0 / len(self.channels)
+        gain = 1.0 / len(self.channels) if self.channels else 1.0
         return { (i, 1): gain for i in self.channels }
 
     def getDescription(self, separator=', '):
