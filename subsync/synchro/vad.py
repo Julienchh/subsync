@@ -6,14 +6,17 @@ speech activity envelope and speech onset/offset intervals.
 """
 
 from array import array
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+import threading
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Auto-wire local `.ai_env` so `numpy`, `onnxruntime`, and `faster_whisper` are always importable
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -32,22 +35,31 @@ logger = logging.getLogger(__name__)
 FRAME_HZ = 100  # 10ms frame resolution (0.01s)
 SAMPLE_RATE = 8000  # 80 samples per 10ms frame
 
+_TLS = threading.local()
+_CACHE_LOCK = threading.RLock()
+_MEDIA_INFO_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+_REF_AUDIO_CACHE: Dict[Tuple[str, int, int, Optional[int], int], Dict[str, Any]] = {}
+_MAX_REF_AUDIO_CACHE = 4
+
 LAST_PCM_BYTES: Optional[bytes] = None
 LAST_SPEECH_ENVELOPE: Optional[List[float]] = None
 LAST_ATTACK_ENVELOPE: Optional[List[float]] = None
 LAST_SPEECH_INTERVALS: Optional[List[Tuple[float, float]]] = None
 LAST_SUB_EVENTS: List[Tuple[float, float, str]] = []
 
-_CREDIT_WATERMARK_MARKERS: Tuple[str, ...] = (
-    "addic7ed.com",
-    "synchro par",
-    "re-sync par",
-    "resync par",
-    "traduit par",
-    "subsynchro",
-    "sous-titres.eu",
-    "sync by",
-    "resync by",
+_CREDIT_WATERMARK_RE = re.compile(
+    r"(?:addic7ed\.com|subsynchro|sous-titres\.eu|tvsubtitles\.net|opensubtitles\.org|"
+    r"sous-titres\s+traduits\s+par|traduits?\s+par\s*(?:la\s+communaut|:|[a-z0-9_\-])|"
+    r"traduction\s*(?:par\b|by\b|:)|re-?synchro\b|"
+    r"synchro(?:nis[ée])?\s*(?:&\s*corrig[ée]\s*)?(?:par\b|by\b|:)|"
+    r"syncro\s*par|re-?sync\s*(?:par\b|by\b)|sync\s*by\b|corrected\s+by\b)",
+    re.IGNORECASE,
+)
+
+_SDH_BRACKET_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}|<[^>]+>")
+_MUSIC_NOTE_RE = re.compile(r"[♪♫♬]+")
+_SPEAKER_PREFIX_RE = re.compile(
+    r"(?:^|\n)\s*(?:[-–—]\s*)?[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ0-9\s\.\-]{1,18}\s*:\s*"
 )
 
 
@@ -55,8 +67,42 @@ def is_credit_watermark(text: str) -> bool:
     """Return True if subtitle text is a non-dialogue credit/watermark line."""
     if not text:
         return False
-    low = text.lower()
-    return any(marker in low for marker in _CREDIT_WATERMARK_MARKERS)
+    return bool(_CREDIT_WATERMARK_RE.search(text))
+
+
+def extract_spoken_dialogue_text(text: str) -> str:
+    """Strip SDH sound-effect annotations (`[MUSIQUE]`, `(Soupire)`), `♪` lyrics, and speaker tags."""
+    if not text:
+        return ""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    # Check if the entire line (or every sub-line) is wrapped in music notes ♪ ... ♪
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    non_music_lines = []
+    for ln in lines:
+        ln_clean = re.sub(r"^[-–—\s]+", "", ln).strip()
+        if ln_clean.startswith(("♪", "♫", "♬")) or ln_clean.endswith(("♪", "♫", "♬")):
+            continue
+        non_music_lines.append(ln)
+    if not non_music_lines:
+        return ""
+    joined = "\n".join(non_music_lines)
+    cleaned = _SDH_BRACKET_RE.sub(" ", joined)
+    cleaned = _MUSIC_NOTE_RE.sub(" ", cleaned)
+    cleaned = _SPEAKER_PREFIX_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"[-–—\s]+", " ", cleaned).strip()
+    # Must contain at least one alphanumeric character to count as spoken dialogue
+    if not re.search(r"[A-Za-zÀ-ÿ0-9]", cleaned):
+        return ""
+    return cleaned
+
+
+def is_pure_sdh_non_speech(text: str) -> bool:
+    """Return True if a subtitle cue contains only non-speech SDH sound effects or music notes."""
+    if not text or not text.strip():
+        return True
+    return extract_spoken_dialogue_text(text) == ""
 
 _SUBTITLE_EXTENSIONS = {
     ".srt", ".ass", ".ssa", ".vtt", ".sub", ".txt", ".smi", ".sami",
@@ -152,6 +198,18 @@ def probe_media_info(path: str) -> Dict:
             ],
             "duration": 0.0,
         }
+
+    try:
+        st_stat = os.stat(path)
+        cache_key = (os.path.realpath(path), int(st_stat.st_mtime_ns), int(st_stat.st_size))
+    except OSError:
+        cache_key = None
+
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            cached_info = _MEDIA_INFO_CACHE.get(cache_key)
+            if cached_info is not None:
+                return cached_info
 
     ffprobe_bin = find_binary("ffprobe")
     cmd = [
@@ -256,10 +314,16 @@ def probe_media_info(path: str) -> Dict:
             "channel_layout_name": ch_layout_str,
         })
 
-    return {
+    info_res = {
         "streams": streams_out,
         "duration": duration,
     }
+    if cache_key is not None:
+        with _CACHE_LOCK:
+            if len(_MEDIA_INFO_CACHE) > 256:
+                _MEDIA_INFO_CACHE.clear()
+            _MEDIA_INFO_CACHE[cache_key] = info_res
+    return info_res
 
 
 def _run_ffmpeg_audio_extract(
@@ -270,6 +334,7 @@ def _run_ffmpeg_audio_extract(
     duration_s: Optional[float],
     audio_filter: Optional[str] = None,
     use_ac1: bool = True,
+    timeout: float = 300.0,
 ) -> subprocess.CompletedProcess:
     ffmpeg_bin = find_binary("ffmpeg")
     cmd = [ffmpeg_bin, "-v", "error", "-nostdin"]
@@ -290,12 +355,16 @@ def _run_ffmpeg_audio_extract(
         cmd.extend(["-af", audio_filter])
     cmd.extend(["-f", "s16le", "-acodec", "pcm_s16le", "-"])
 
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffmpeg audio extraction timed out after {timeout:.0f}s for {path!r}") from exc
 
 
 def extract_pcm_s16le(
@@ -311,11 +380,11 @@ def extract_pcm_s16le(
     """Decode audio stream from media file to mono 16-bit signed PCM via ffmpeg.
 
     For 5.1/7.1 surround streams (`channels >= 6`), isolates the Front Center (`FC`)
-    dialogue channel with a vocal bandpass (`highpass=f=200,lowpass=f=3200`) and
+    dialogue channel with a vocal bandpass (`highpass=f=200,lowpass=f=3800`) and
     verifies sufficient signal energy (`max_rms >= 30.0`), falling back to mono
     downmix with bandpass if `FC` is silent.
     For stereo streams (`channels == 2`) or when `bandpass=True`, applies vocal
-    bandpass (`highpass=f=200,lowpass=f=3200`).
+    bandpass (`highpass=f=200,lowpass=f=3800`).
     For mono streams (`channels == 1`) with `bandpass=False`, performs direct
     `-ac 1` extraction so synthetic test fixtures remain untouched.
     """
@@ -368,7 +437,7 @@ def extract_pcm_s16le(
             sample_rate=sample_rate,
             start_s=start_s,
             duration_s=duration_s,
-            audio_filter="pan=mono|c0=FC,highpass=f=200,lowpass=f=3200",
+            audio_filter="pan=mono|c0=FC,highpass=f=200,lowpass=f=3800",
             use_ac1=False,
         )
         if proc_fc.stdout:
@@ -383,7 +452,7 @@ def extract_pcm_s16le(
             sample_rate=sample_rate,
             start_s=start_s,
             duration_s=duration_s,
-            audio_filter="highpass=f=200,lowpass=f=3200",
+            audio_filter="highpass=f=200,lowpass=f=3800",
             use_ac1=True,
         )
     elif (channels is not None and channels >= 2) or bandpass:
@@ -393,7 +462,7 @@ def extract_pcm_s16le(
             sample_rate=sample_rate,
             start_s=start_s,
             duration_s=duration_s,
-            audio_filter="highpass=f=200,lowpass=f=3200",
+            audio_filter="highpass=f=200,lowpass=f=3800",
             use_ac1=True,
         )
     else:
@@ -442,12 +511,16 @@ def extract_embedded_subtitles(
         cmd.extend(["-map", "0:s:0"])
     cmd.extend(["-f", "srt", "-"])
 
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffmpeg subtitle extraction timed out after 120s for {path!r}") from exc
     if proc.returncode != 0 and not proc.stdout:
         err_msg = proc.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"ffmpeg subtitle extraction failed for {path!r}: {err_msg}")
@@ -652,6 +725,7 @@ def subtitles_to_intervals(
     subs_or_path,
     encoding: str = "utf-8",
     fps: Optional[float] = None,
+    update_global_state: bool = True,
 ) -> List[Tuple[float, float]]:
     """Convert an SSAFile, Subtitles instance, or subtitle file path into sorted (start_s, end_s) intervals."""
     global LAST_SUB_EVENTS
@@ -669,24 +743,29 @@ def subtitles_to_intervals(
                     txt = getattr(item, "plaintext", getattr(item, "text", "")).strip()
                     if is_credit_watermark(txt):
                         continue
+                    spoken_txt = extract_spoken_dialogue_text(txt)
+                    if not spoken_txt:
+                        continue
                     s = item.start / 1000.0
                     e = item.end / 1000.0
                     if e > s >= 0.0:
                         res.append((s, e))
-                        sub_evs_seq.append((s, e, txt.replace("\n", " ")))
+                        sub_evs_seq.append((s, e, spoken_txt))
             elif isinstance(item, (tuple, list)) and len(item) >= 2:
                 txt = str(item[2]).strip() if len(item) >= 3 and item[2] is not None else ""
-                if txt and is_credit_watermark(txt):
+                if txt and (is_credit_watermark(txt) or is_pure_sdh_non_speech(txt)):
                     continue
+                spoken_txt = extract_spoken_dialogue_text(txt) if txt else ""
                 s, e = float(item[0]), float(item[1])
                 if e > s >= 0.0:
                     res.append((s, e))
-                    if txt:
-                        sub_evs_seq.append((s, e, txt.replace("\n", " ")))
+                    if spoken_txt:
+                        sub_evs_seq.append((s, e, spoken_txt))
         res.sort(key=lambda x: (x[0], x[1]))
-        if sub_evs_seq:
+        if sub_evs_seq and update_global_state:
             sub_evs_seq.sort(key=lambda x: (x[0], x[1]))
             LAST_SUB_EVENTS = sub_evs_seq
+            _TLS.last_sub_events = sub_evs_seq
             try:
                 from subsync.synchro import ai_engine
                 ai_engine.set_last_subtitles(sub_evs_seq, None)
@@ -698,6 +777,7 @@ def subtitles_to_intervals(
 
     intervals = []
     sub_events_with_text: List[Tuple[float, float, str]] = []
+    fallback_intervals = []
     for ev in subs.events:
         if getattr(ev, "is_comment", False) or getattr(ev, "is_drawing", False):
             continue
@@ -708,17 +788,26 @@ def subtitles_to_intervals(
         end_s = ev.end / 1000.0
         if end_s > start_s and end_s > 0.0:
             s_clamped = max(0.0, start_s)
+            fallback_intervals.append((s_clamped, end_s))
+            spoken_txt = extract_spoken_dialogue_text(txt)
+            if not spoken_txt:
+                continue
             intervals.append((s_clamped, end_s))
-            sub_events_with_text.append((s_clamped, end_s, txt.replace("\n", " ")))
+            sub_events_with_text.append((s_clamped, end_s, spoken_txt))
+
+    if not intervals and fallback_intervals:
+        intervals = fallback_intervals
 
     intervals.sort(key=lambda x: (x[0], x[1]))
     sub_events_with_text.sort(key=lambda x: (x[0], x[1]))
-    LAST_SUB_EVENTS = sub_events_with_text
-    try:
-        from subsync.synchro import ai_engine
-        ai_engine.set_last_subtitles(sub_events_with_text, subs)
-    except Exception:
-        pass
+    if update_global_state:
+        LAST_SUB_EVENTS = sub_events_with_text
+        _TLS.last_sub_events = sub_events_with_text
+        try:
+            from subsync.synchro import ai_engine
+            ai_engine.set_last_subtitles(sub_events_with_text, subs)
+        except Exception:
+            pass
     return intervals
 
 
@@ -742,7 +831,7 @@ def intervals_to_envelope(
         return []
 
     envelope = [0.0] * num_frames
-    edge_frames = max(1, int(round(0.05 * frame_hz)))
+    edge_frames = max(1, int(round(0.06 * frame_hz)))
 
     for s_raw, e_raw in intervals:
         s = s_raw * scale_a
@@ -755,9 +844,9 @@ def intervals_to_envelope(
             j = min(num_frames, i + 1)
         seg_len = j - i
         for m in range(i, j):
-            dist_edge = min(m - i, j - 1 - m)
-            if edge_boost > 0.0 and dist_edge < edge_frames and seg_len >= 2 * edge_frames:
-                val = 1.0 + edge_boost * (1.0 - dist_edge / float(edge_frames))
+            dist_start = m - i
+            if edge_boost > 0.0 and dist_start < edge_frames and seg_len >= edge_frames:
+                val = 1.0 + edge_boost * (1.0 - dist_start / float(edge_frames))
             else:
                 val = 1.0
             if val > envelope[m]:
@@ -775,16 +864,51 @@ def extract_speech_envelope(
     frame_hz: int = FRAME_HZ,
 ) -> Tuple[List[float], List[Tuple[float, float]]]:
     """Extract 100 Hz activity envelope and intervals from any reference file (audio, video, or subtitle)."""
+    global LAST_PCM_BYTES, LAST_SPEECH_ENVELOPE, LAST_ATTACK_ENVELOPE, LAST_SPEECH_INTERVALS
     if is_subtitle_file_path(path):
-        intervals = subtitles_to_intervals(path, encoding=encoding, fps=fps)
+        intervals = subtitles_to_intervals(path, encoding=encoding, fps=fps, update_global_state=False)
         envelope = intervals_to_envelope(intervals, frame_hz=frame_hz)
         return envelope, intervals
 
     if stream_type and stream_type.startswith("subtitle"):
         subs = extract_embedded_subtitles(path, stream_index=stream_index)
-        intervals = subtitles_to_intervals(subs)
+        intervals = subtitles_to_intervals(subs, update_global_state=False)
         envelope = intervals_to_envelope(intervals, frame_hz=frame_hz)
         return envelope, intervals
+
+    ref_cache_key = None
+    try:
+        st_stat = os.stat(path)
+        ref_cache_key = (
+            os.path.realpath(path),
+            int(st_stat.st_mtime_ns),
+            int(st_stat.st_size),
+            stream_index,
+            int(frame_hz),
+        )
+    except OSError:
+        ref_cache_key = None
+
+    if ref_cache_key is not None:
+        with _CACHE_LOCK:
+            cached_bundle = _REF_AUDIO_CACHE.get(ref_cache_key)
+        if cached_bundle is not None:
+            env = cached_bundle["envelope"]
+            ivs = cached_bundle["intervals"]
+            pcm_b = cached_bundle.get("pcm_bytes")
+            att_env = cached_bundle.get("attack_envelope")
+            vad_res = cached_bundle.get("vad_result")
+            if pcm_b is not None:
+                LAST_PCM_BYTES = pcm_b
+                LAST_SPEECH_ENVELOPE = env
+                LAST_ATTACK_ENVELOPE = att_env
+                LAST_SPEECH_INTERVALS = ivs
+                try:
+                    from subsync.synchro import ai_engine
+                    ai_engine.restore_vad_state(pcm_b, SAMPLE_RATE, vad_res)
+                except Exception:
+                    pass
+            return env, ivs
 
     # Probe container streams once to detect subtitle streams or audio channel layout
     channels: Optional[int] = None
@@ -796,7 +920,7 @@ def extract_speech_envelope(
             for st in streams:
                 if st.get("index") == stream_index and str(st.get("type", "")).startswith("subtitle"):
                     subs = extract_embedded_subtitles(path, stream_index=stream_index)
-                    intervals = subtitles_to_intervals(subs)
+                    intervals = subtitles_to_intervals(subs, update_global_state=False)
                     envelope = intervals_to_envelope(intervals, frame_hz=frame_hz)
                     return envelope, intervals
         matched_audio = None
@@ -823,4 +947,22 @@ def extract_speech_envelope(
         channels=channels,
         channel_layout=channel_layout,
     )
-    return pcm_to_speech_envelope(pcm_bytes, sample_rate=SAMPLE_RATE, frame_hz=frame_hz)
+    env, ivs = pcm_to_speech_envelope(pcm_bytes, sample_rate=SAMPLE_RATE, frame_hz=frame_hz)
+    if ref_cache_key is not None:
+        try:
+            from subsync.synchro import ai_engine
+            vad_res = ai_engine.get_last_vad_result()
+        except Exception:
+            vad_res = None
+        with _CACHE_LOCK:
+            if len(_REF_AUDIO_CACHE) >= _MAX_REF_AUDIO_CACHE:
+                oldest_k = next(iter(_REF_AUDIO_CACHE))
+                _REF_AUDIO_CACHE.pop(oldest_k, None)
+            _REF_AUDIO_CACHE[ref_cache_key] = {
+                "envelope": env,
+                "intervals": ivs,
+                "pcm_bytes": pcm_bytes,
+                "attack_envelope": LAST_ATTACK_ENVELOPE,
+                "vad_result": vad_res,
+            }
+    return env, ivs

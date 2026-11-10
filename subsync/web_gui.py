@@ -910,6 +910,7 @@ class _JobManager:
                         stderr=subprocess.STDOUT,
                         text=True,
                         bufsize=1,
+                        start_new_session=True,
                     )
                     with self.lock:
                         self.proc = proc
@@ -935,7 +936,12 @@ class _JobManager:
     def stop(self) -> None:
         with self.lock:
             if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
+                try:
+                    import signal
+
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                except Exception:
+                    self.proc.terminate()
             self.running = False
 
     def status(self) -> Dict[str, Any]:

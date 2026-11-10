@@ -16,9 +16,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 _WATERMARK_RE = re.compile(
-    r"(?:addic7ed\.com|synchro\s*par|syncro\s*par|re-?sync\s*par|"
-    r"sync\s*by|traduit\s*par\s*la\s*communaut|subsynchro|sous-titres\.eu|"
-    r"tvsubtitles\.net|opensubtitles\.org)",
+    r"(?:addic7ed\.com|subsynchro|sous-titres\.eu|tvsubtitles\.net|opensubtitles\.org|"
+    r"sous-titres\s+traduits\s+par|traduits?\s+par\s*(?:la\s+communaut|:|[a-z0-9_\-])|"
+    r"traduction\s*(?:par\b|by\b|:)|re-?synchro\b|"
+    r"synchro(?:nis[ée])?\s*(?:&\s*corrig[ée]\s*)?(?:par\b|by\b|:)|"
+    r"syncro\s*par|re-?sync\s*(?:par\b|by\b)|sync\s*by\b|corrected\s+by\b)",
     re.IGNORECASE,
 )
 
@@ -28,6 +30,93 @@ def is_credit_watermark(text: str) -> bool:
     if not text:
         return False
     return bool(_WATERMARK_RE.search(text))
+
+
+def _destack_zero_duration_clusters(events, ref_intervals=None):
+    """Unstack pathological 0ms / micro-duration cue clusters (e.g. S09E02 Mandarin cues) across active speech."""
+    if not events or len(events) < 2:
+        return 0
+    n = len(events)
+    fixed = 0
+    i = 0
+    while i < n:
+        dur_i = events[i].end - events[i].start
+        if dur_i <= 250:
+            j = i + 1
+            while (
+                j < n
+                and abs(events[j].start - events[i].start) <= 30
+                and (events[j].end - events[j].start) <= 250
+            ):
+                j += 1
+            cluster_len = j - i
+            if cluster_len >= 2:
+                cluster_t_ms = events[i].start
+                prev_end_ms = events[i - 1].end if i > 0 else 0
+                next_start_ms = events[j].start if j < n else (cluster_t_ms + cluster_len * 2200)
+                gap_before_ms = cluster_t_ms - prev_end_ms
+                gap_after_ms = next_start_ms - cluster_t_ms
+
+                if gap_before_ms >= 8000 and gap_after_ms < gap_before_ms * 0.5:
+                    win_s_ms = prev_end_ms + 250
+                    win_e_ms = cluster_t_ms - 120
+                elif gap_after_ms >= 4000:
+                    win_s_ms = max(prev_end_ms + 80, cluster_t_ms)
+                    win_e_ms = next_start_ms - 120
+                elif gap_before_ms >= 4000:
+                    win_s_ms = prev_end_ms + 150
+                    win_e_ms = max(win_s_ms + cluster_len * 450, next_start_ms - 80)
+                else:
+                    win_s_ms = max(prev_end_ms + 70, cluster_t_ms)
+                    win_e_ms = max(win_s_ms + cluster_len * 450, next_start_ms - 70)
+
+                # Narrow [win_s_ms, win_e_ms] to actual speech span from ref_intervals if available
+                if ref_intervals:
+                    win_s_sec = win_s_ms / 1000.0
+                    win_e_sec = win_e_ms / 1000.0
+                    active_ivs = [
+                        (max(win_s_sec, rs), min(win_e_sec, re_t))
+                        for rs, re_t in ref_intervals
+                        if min(win_e_sec, re_t) - max(win_s_sec, rs) >= 0.25
+                    ]
+                    if active_ivs:
+                        sp_s_ms = int(round(active_ivs[0][0] * 1000.0))
+                        sp_e_ms = int(round(active_ivs[-1][1] * 1000.0))
+                        if sp_e_ms - sp_s_ms >= cluster_len * 450:
+                            win_s_ms = max(win_s_ms, sp_s_ms)
+                            win_e_ms = min(win_e_ms, sp_e_ms)
+
+                span_ms = max(cluster_len * 420, win_e_ms - win_s_ms)
+                weights = []
+                for k in range(i, j):
+                    txt = re.sub(r"<[^>]+>", "", getattr(events[k], "plaintext", events[k].text) or "").strip()
+                    weights.append(max(6.0, float(len(txt))))
+                w_sum = sum(weights)
+                gap_ms = 70
+                usable_ms = max(cluster_len * 350, span_ms - gap_ms * (cluster_len - 1))
+                cur_ms = win_s_ms
+                for idx_c, k in enumerate(range(i, j)):
+                    alloc_ms = int(round(usable_ms * (weights[idx_c] / w_sum)))
+                    alloc_ms = max(350, min(4200, alloc_ms))
+                    events[k].start = cur_ms
+                    events[k].end = cur_ms + alloc_ms
+                    cur_ms = events[k].end + gap_ms
+                    fixed += 1
+                i = j
+                continue
+            elif dur_i < 300:
+                next_s_ms = events[i + 1].start if (i + 1 < n) else (events[i].start + 1500)
+                prev_e_ms = events[i - 1].end if i > 0 else 0
+                if events[i].start < prev_e_ms + 40:
+                    events[i].start = prev_e_ms + 40
+                target_end = min(next_s_ms - 60, events[i].start + 900)
+                if target_end >= events[i].start + 300:
+                    events[i].end = target_end
+                else:
+                    events[i].end = events[i].start + 300
+                fixed += 1
+        i += 1
+    return fixed
 
 
 class Subtitles(pysubs2.SSAFile):
@@ -42,6 +131,7 @@ class Subtitles(pysubs2.SSAFile):
             ev
             for ev in self.events
             if not is_credit_watermark(getattr(ev, "plaintext", ev.text))
+            and (getattr(ev, "plaintext", ev.text) or "").strip() != ""
         ]
 
     def sort(self):
@@ -104,6 +194,7 @@ class Subtitles(pysubs2.SSAFile):
                 ev.start = 0
             filtered_events.append(ev)
         res.events = filtered_events
+        _destack_zero_duration_clusters(res.events)
         return res
 
     def verify_and_heal_with_vad(self, ref_envelope, ref_intervals=None, frame_hz=100):
@@ -119,17 +210,23 @@ class Subtitles(pysubs2.SSAFile):
         if not self.events or not ref_envelope or frame_hz <= 0:
             return 0, 0, 0
 
+        _destack_zero_duration_clusters(self.events, ref_intervals=ref_intervals)
+
         env_len = len(ref_envelope)
         if env_len < frame_hz * 30:
             return 0, 0, 0
 
         try:
             import numpy as np
-            from subsync.synchro import aligner
+            from subsync.synchro import aligner, vad
         except Exception:
             return 0, 0, 0
 
-        ref_arr = np.asarray(ref_envelope, dtype=np.float32)
+        ref_arr = np.asarray(ref_envelope, dtype=np.float64)
+        ref_attack_arr = np.asarray(
+            aligner._build_vocal_attack_signal(ref_envelope, ref_intervals, frame_hz=frame_hz),
+            dtype=np.float64,
+        )
         n_ev = len(self.events)
         if n_ev < 5:
             return 0, 1, 1
@@ -186,26 +283,37 @@ class Subtitles(pysubs2.SSAFile):
                     hits += 1
             return (float(hits) / float(valid)) if valid > 0 else 0.0
 
+        # Phase A: Evaluate hybrid (envelope + vocal-attack) NCC curves across all sub-windows
+        win_evals = []
         for w_idx, ev_idxs in enumerate(raw_windows):
             w_ivs = [
                 (self.events[idx].start / 1000.0, self.events[idx].end / 1000.0)
                 for idx in ev_idxs
                 if self.events[idx].end > self.events[idx].start
+                and not vad.is_pure_sdh_non_speech(getattr(self.events[idx], "plaintext", self.events[idx].text))
             ]
             w_dur = (w_ivs[-1][1] - w_ivs[0][0]) if w_ivs else 0.0
             if len(w_ivs) < 5 or w_dur < 12.0:
-                verified_windows += 1
+                win_evals.append(None)
                 continue
 
-            curve = aligner._correlate_window_curve(
-                w_ivs,
+            prev_iv_end = (self.events[raw_windows[w_idx - 1][-1]].end / 1000.0) if w_idx > 0 else None
+            next_iv_start = (
+                (self.events[raw_windows[w_idx + 1][0]].start / 1000.0)
+                if (w_idx + 1 < total_windows)
+                else None
+            )
+            curve = aligner._ncc_curve_act_np(
                 ref_arr,
+                w_ivs,
+                prev_iv_end,
+                next_iv_start,
+                pad_frames=rad_frames,
                 frame_hz=frame_hz,
-                search_center_b=0.0,
-                search_radius_s=search_rad_s,
+                ref_attack_arr=ref_attack_arr,
             )
             if curve is None or len(curve) != 2 * rad_frames + 1:
-                verified_windows += 1
+                win_evals.append(None)
                 continue
 
             tol_f = max(1, int(round(0.10 * frame_hz)))
@@ -213,46 +321,104 @@ class Subtitles(pysubs2.SSAFile):
             c1 = min(len(curve), rad_frames + tol_f + 1)
             zero_ncc = float(np.max(curve[c0:c1]))
 
-            prev_end_s = (
-                (self.events[raw_windows[w_idx - 1][-1]].end / 1000.0) + 0.08
-                if w_idx > 0
-                else 0.0
-            )
-            next_start_s = (
-                (self.events[raw_windows[w_idx + 1][0]].start / 1000.0) - 0.08
-                if (w_idx + 1 < total_windows)
+            prev_bound_s = (prev_iv_end + 0.08) if prev_iv_end is not None else 0.0
+            next_bound_s = (
+                (next_iv_start - 0.08)
+                if next_iv_start is not None
                 else (w_ivs[-1][1] + search_rad_s + 10.0)
             )
-            min_delta = max(-search_rad_s, prev_end_s - w_ivs[0][0])
-            max_delta = min(search_rad_s, next_start_s - w_ivs[-1][1])
+            min_delta = max(-search_rad_s, prev_bound_s - w_ivs[0][0])
+            max_delta = min(search_rad_s, next_bound_s - w_ivs[-1][1])
             if max_delta <= min_delta + 0.05:
-                verified_windows += 1
+                win_evals.append(None)
                 continue
 
             k_lo = max(0, min(len(curve) - 1, int(round((min_delta + search_rad_s) * frame_hz))))
             k_hi = max(k_lo, min(len(curve) - 1, int(round((max_delta + search_rad_s) * frame_hz))))
             sub_curve = curve[k_lo : k_hi + 1]
             if len(sub_curve) == 0:
+                win_evals.append(None)
+                continue
+
+            best_k = k_lo + int(np.argmax(sub_curve))
+            best_ncc = float(curve[best_k])
+            best_delta = float(best_k - rad_frames) / float(frame_hz)
+            win_evals.append(
+                {
+                    "w_ivs": w_ivs,
+                    "zero_ncc": zero_ncc,
+                    "best_ncc": best_ncc,
+                    "best_delta": best_delta,
+                    "min_delta": min_delta,
+                    "max_delta": max_delta,
+                }
+            )
+
+        # Phase B: Neighbor-coherent anti-spike audit & self-healing
+        for w_idx, ev_idxs in enumerate(raw_windows):
+            ev_info = win_evals[w_idx]
+            if ev_info is None:
                 verified_windows += 1
                 continue
 
-            best_rel_k = int(np.argmax(sub_curve))
-            best_k = k_lo + best_rel_k
-            best_ncc = float(curve[best_k])
-            best_delta = (float(best_k - rad_frames)) / float(frame_hz)
+            w_ivs = ev_info["w_ivs"]
+            zero_ncc = ev_info["zero_ncc"]
+            best_ncc = ev_info["best_ncc"]
+            best_delta = ev_info["best_delta"]
+            min_delta = ev_info["min_delta"]
+            max_delta = ev_info["max_delta"]
 
-            if (
+            # Recompute tight neighbor collision bounds using any already-healed previous window
+            if w_idx > 0:
+                live_prev_end = (self.events[raw_windows[w_idx - 1][-1]].end / 1000.0) + 0.08
+                min_delta = max(min_delta, live_prev_end - w_ivs[0][0])
+
+            prev_delta = win_evals[w_idx - 1]["best_delta"] if (w_idx > 0 and win_evals[w_idx - 1]) else 0.0
+            next_delta = (
+                win_evals[w_idx + 1]["best_delta"]
+                if (w_idx + 1 < total_windows and win_evals[w_idx + 1])
+                else 0.0
+            )
+            isolated_spike = (
+                0 < w_idx < total_windows - 1
+                and abs(best_delta) >= 0.22
+                and abs(prev_delta) <= 0.14
+                and abs(next_delta) <= 0.14
+            )
+
+            vh_before = _win_vocal_hit_rate(w_ivs, 0.0)
+            eligible = False
+            if isolated_spike:
+                if (
+                    zero_ncc < 0.22
+                    and vh_before < 0.76
+                    and best_ncc >= 0.50
+                    and (best_ncc - zero_ncc) >= 0.16
+                ):
+                    eligible = True
+            elif (
                 abs(best_delta) >= 0.16
                 and best_ncc >= 0.46
                 and (best_ncc - zero_ncc) >= 0.065
             ):
+                eligible = True
+
+            if eligible and max_delta > min_delta + 0.05:
                 refined_delta = aligner._refine_act_vocal_attack(
-                    w_ivs, 1.0, best_delta, ref_arr, frame_hz
+                    None,
+                    w_ivs,
+                    best_delta,
+                    frame_hz=frame_hz,
+                    ref_intervals=ref_intervals,
                 )
                 refined_delta = max(min_delta, min(max_delta, refined_delta))
-                vh_before = _win_vocal_hit_rate(w_ivs, 0.0)
                 vh_after = _win_vocal_hit_rate(w_ivs, refined_delta)
-                if vh_after >= vh_before - 0.02 and (vh_after >= 0.80 or vh_after > vh_before):
+                vh_ok = (
+                    (vh_after >= vh_before + 0.10)
+                    if isolated_spike
+                    else (vh_after >= vh_before - 0.02 and (vh_after >= 0.80 or vh_after > vh_before))
+                )
+                if vh_ok:
                     shift_ms = int(round(refined_delta * 1000.0))
                     if abs(shift_ms) >= 120:
                         for idx in ev_idxs:
@@ -293,20 +459,30 @@ class Subtitles(pysubs2.SSAFile):
         if env_len < frame_hz * 10:
             return 0
 
+        try:
+            from subsync.synchro import vad
+        except Exception:
+            vad = None
+
         modified_count = 0
         n_ev = len(self.events)
+        orig_starts = [ev.start / 1000.0 for ev in self.events]
+        orig_ends = [ev.end / 1000.0 for ev in self.events]
 
         for i, ev in enumerate(self.events):
-            s_sec = ev.start / 1000.0
-            e_sec = ev.end / 1000.0
+            s_sec = orig_starts[i]
+            e_sec = orig_ends[i]
             dur = e_sec - s_sec
             if dur <= 0.15 or dur > 12.0:
                 continue
 
-            prev_end_s = (self.events[i - 1].end / 1000.0) if i > 0 else 0.0
-            next_start_s = (self.events[i + 1].start / 1000.0) if (i + 1 < n_ev) else (e_sec + 10.0)
-
             raw_txt = getattr(ev, "plaintext", ev.text) or ""
+            if vad is not None and vad.is_pure_sdh_non_speech(raw_txt):
+                continue
+
+            prev_end_s = max(self.events[i - 1].end / 1000.0, orig_ends[i - 1]) if i > 0 else 0.0
+            next_start_s = orig_starts[i + 1] if (i + 1 < n_ev) else (e_sec + 10.0)
+
             clean_txt = re.sub(r"<[^>]+>", "", raw_txt).replace("\n", " ").strip()
             char_count = max(1, len(clean_txt))
             min_read_dur = max(0.65, min(2.20, char_count / 21.0))
@@ -340,17 +516,16 @@ class Subtitles(pysubs2.SSAFile):
                                         new_e = min(next_start_s - 0.075, new_e + shift_fwd)
                                 break
 
-            # 1B. Anti-Late Start (Unclaimed Continuous Speech Capture up to -0.65s):
+            # 1B. Anti-Late Start (Unclaimed Continuous Speech Capture capped at -0.25s):
             # If the actor is already speaking at s_sec (or within [-30ms, +60ms]), walk backward
-            # up to 0.65s (tolerant of brief <80ms consonant dips) to find the true vocal attack
-            # immediately preceded by >= 120ms of clean silence after prev_end_s.
+            # up to 0.25s to find the true vocal attack immediately preceded by >= 150ms of clean silence.
             if not snapped_start and 15 <= k_s < env_len - 10:
                 at_start_slice = ref_envelope[max(0, k_s - 3) : min(env_len, k_s + 6)]
                 if at_start_slice and (
                     (sum(at_start_slice) / len(at_start_slice)) >= 0.38 or max(at_start_slice) >= 0.52
                 ):
-                    earliest_allowed_s = max((prev_end_s + 0.14) if i > 0 else 0.0, s_sec - 0.65)
-                    earliest_k = max(12, int(round(earliest_allowed_s * frame_hz)))
+                    earliest_allowed_s = max((prev_end_s + 0.16) if i > 0 else 0.0, s_sec - 0.25)
+                    earliest_k = max(15, int(round(earliest_allowed_s * frame_hz)))
                     if k_s > earliest_k + 3:
                         onset_k = None
                         low_run = 0
@@ -358,17 +533,16 @@ class Subtitles(pysubs2.SSAFile):
                             v = ref_envelope[k]
                             if v < 0.20:
                                 low_run += 1
-                                # Only stop backward search if we hit >= 80ms of continuous silence
                                 if low_run >= 8:
                                     break
                             else:
                                 low_run = 0
-                                # Check if [k - 12 : k] is a clean >= 120ms silence gap before frame k
-                                sil_before = ref_envelope[max(0, k - 12) : k]
+                                # Check if [k - 15 : k] is a clean >= 150ms silence gap before frame k
+                                sil_before = ref_envelope[max(0, k - 15) : k]
                                 if (
-                                    len(sil_before) >= 10
-                                    and (sum(sil_before) / len(sil_before)) < 0.18
-                                    and max(sil_before) < 0.32
+                                    len(sil_before) >= 12
+                                    and (sum(sil_before) / len(sil_before)) < 0.15
+                                    and max(sil_before) < 0.28
                                 ):
                                     onset_k = k
                         if onset_k is not None:
@@ -417,9 +591,10 @@ class Subtitles(pysubs2.SSAFile):
                         if cand_e > new_e + 0.03:
                             new_e = cand_e
                 else:
-                    # Case B: Forward Speech-Stop Scanner + Tail Silence Check
-                    # Find where speech starts inside [k_new_s, k_e] and where the final utterance ends,
-                    # trimming any dead-silence overhang right down to max(new_s + min_read_dur, t_stop + 0.10s).
+                    # Case B: Backward Last-Speech Finder + Tail Silence Verification
+                    # Scan backward from k_e - 1 down to scan_start_k to locate the end of the LAST
+                    # speech burst inside [k_new_s, k_e], so multi-clause subtitles with internal
+                    # pauses are never truncated at the first clause.
                     first_sp_k = None
                     for k in range(k_new_s, k_e):
                         if ref_envelope[k] >= 0.35:
@@ -428,28 +603,20 @@ class Subtitles(pysubs2.SSAFile):
                     if first_sp_k is not None:
                         scan_start_k = max(first_sp_k + 8, int(round((new_s + 0.20) * frame_hz)))
                         stop_k = None
-                        for k in range(scan_start_k, k_e - 12):
-                            if ref_envelope[k - 1] >= 0.25 and ref_envelope[k] < 0.25:
-                                sil_win = ref_envelope[k : min(k_e, k + 22)]
-                                if sil_win and (sum(sil_win) / len(sil_win)) < 0.18:
-                                    rem_tail = ref_envelope[k:k_e]
-                                    rem_mean = sum(rem_tail) / len(rem_tail)
-                                    silent_frac = sum(1 for x in rem_tail if x < 0.25) / float(len(rem_tail))
-                                    if rem_mean < 0.16 and silent_frac >= 0.85:
-                                        stop_k = k
-                                        break
-                        if stop_k is None:
-                            # Fallback: check last frame with speech >= 0.32 before k_e
-                            for k in range(k_e - 1, scan_start_k - 1, -1):
-                                if ref_envelope[k] >= 0.32:
+                        for k in range(k_e - 1, scan_start_k - 1, -1):
+                            if ref_envelope[k] >= 0.32:
+                                burst = ref_envelope[max(k_new_s, k - 3) : k + 1]
+                                if burst and (sum(burst) / len(burst)) >= 0.26:
                                     stop_k = k + 1
                                     break
-                        if stop_k is not None:
-                            voice_stop_s = (stop_k / float(frame_hz)) + 0.10
-                            if voice_stop_s < e_sec - 0.06:
-                                cand_e = max(new_s + min_read_dur, voice_stop_s)
-                                if cand_e < new_e - 0.035:
-                                    new_e = cand_e
+                        if stop_k is not None and stop_k < k_e - 8:
+                            rem_tail = ref_envelope[stop_k:k_e]
+                            if rem_tail and (sum(rem_tail) / len(rem_tail)) < 0.18:
+                                voice_stop_s = (stop_k / float(frame_hz)) + 0.10
+                                if voice_stop_s < e_sec - 0.06:
+                                    cand_e = max(new_s + min_read_dur, voice_stop_s)
+                                    if cand_e < new_e - 0.035:
+                                        new_e = cand_e
 
             # 3. Minimum comfortable reading duration extension if space permits and speech was active
             if (new_e - new_s) < min_read_dur and (next_start_s - new_e) > 0.15:

@@ -36,6 +36,83 @@ _HTML_REJECT_RE = re.compile(
 
 _SUBTITLE_ARCHIVE_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub")
 
+_CHAR_TO_WIN1252_BYTE = {}
+for _b in range(0x80, 0x100):
+    _CHAR_TO_WIN1252_BYTE[chr(_b)] = _b
+    try:
+        _CHAR_TO_WIN1252_BYTE[bytes([_b]).decode("cp1252")] = _b
+    except UnicodeDecodeError:
+        pass
+
+
+def repair_mojibake_text(text: str) -> str:
+    """
+    Repair span-level double-encoded UTF-8-via-CP1252/Latin-1 mojibake (including
+    mixed files where some accents like 'é' are clean UTF-8 while 'ç', 'à', 'è',
+    'Ç', 'É', 'œ', '’', '…' were double-encoded as 'Ã§', 'Ã ', 'Ã¨', 'Ã‡', 'Ã‰', 'Å“', 'â€™')
+    as well as raw C1 control bytes U+0080..U+009F from ISO-8859-1 misdecoding.
+    """
+    if not text:
+        return text
+
+    if "ï»¿" in text:
+        text = text.replace("ï»¿", "")
+
+    for _ in range(2):
+        if not any(m in text for m in ("Ã", "Â", "Å", "â€", "â™", "â‚", "Ë")):
+            break
+        out = []
+        i = 0
+        n = len(text)
+        changed = False
+        while i < n:
+            c0 = text[i]
+            b0 = _CHAR_TO_WIN1252_BYTE.get(c0)
+            # 3-byte UTF-8 mojibake starting with 0xE2 ('â', e.g. â€™ -> ’, â€¦ -> …, â™ª -> ♪)
+            if b0 == 0xE2 and i + 2 < n:
+                b1 = _CHAR_TO_WIN1252_BYTE.get(text[i + 1])
+                b2 = _CHAR_TO_WIN1252_BYTE.get(text[i + 2])
+                if b1 is not None and 0x80 <= b1 <= 0xBF and b2 is not None and 0x80 <= b2 <= 0xBF:
+                    try:
+                        out.append(bytes([b0, b1, b2]).decode("utf-8", errors="strict"))
+                        i += 3
+                        changed = True
+                        continue
+                    except UnicodeDecodeError:
+                        pass
+            # 2-byte UTF-8 mojibake starting with 0xC2..0xC5 (Â, Ã, Ä, Å) or 0xCB (Ë)
+            if b0 in (0xC2, 0xC3, 0xC4, 0xC5, 0xCB) and i + 1 < n:
+                b1 = _CHAR_TO_WIN1252_BYTE.get(text[i + 1])
+                if b1 is not None and 0x80 <= b1 <= 0xBF:
+                    try:
+                        out.append(bytes([b0, b1]).decode("utf-8", errors="strict"))
+                        i += 2
+                        changed = True
+                        continue
+                    except UnicodeDecodeError:
+                        pass
+            out.append(c0)
+            i += 1
+        text = "".join(out)
+        if not changed:
+            break
+
+    # Repair raw C1 control characters U+0080..U+009F (CP1252 bytes decoded as ISO-8859-1)
+    if any(0x80 <= ord(ch) <= 0x9F for ch in text):
+        fixed_c1 = []
+        for ch in text:
+            code = ord(ch)
+            if 0x80 <= code <= 0x9F:
+                try:
+                    fixed_c1.append(bytes([code]).decode("cp1252"))
+                    continue
+                except UnicodeDecodeError:
+                    pass
+            fixed_c1.append(ch)
+        text = "".join(fixed_c1)
+
+    return text
+
 
 def _unwrap_compressed_payload(raw_bytes: bytes) -> bytes:
     """
@@ -194,9 +271,10 @@ def normalize_subtitle_bytes(
     except UnicodeDecodeError:
         decoded = payload.decode("iso-8859-1", errors="replace")
 
-    # Strip any residual Unicode BOM and normalize CRLF / CR line endings to LF
+    # Strip any residual Unicode BOM, repair mixed/double UTF-8 mojibake, and normalize line endings
     if decoded.startswith("\ufeff"):
         decoded = decoded.lstrip("\ufeff")
+    decoded = repair_mojibake_text(decoded)
     normalized = decoded.replace("\r\n", "\n").replace("\r", "\n")
 
     # Check for HTML error / rate-limit pages before generic validation for clearer error messages

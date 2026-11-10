@@ -369,6 +369,25 @@ class TestSeriesSubtitleDownload(unittest.TestCase):
             self.assertEqual(summary.failed, 0)
             self.assertEqual(summary.results[0].provider_name, "gestdown")
 
+    def test_06_mixed_utf8_cp1252_mojibake_repair_s06e02_regression(self):
+        """Verify mixed single-encoded UTF-8 ('é') + double-encoded CP1252 mojibake ('faÃ§on', 'Ã ', 'Ã‡', 'Å“') repairs cleanly."""
+        from subsync.download.normalizer import normalize_subtitle_bytes
+
+        # Exact hybrid corruption pattern found in Addic7ed S06E02 ('réputation' clean UTF-8 + 'faÃ§on' / 'Ã ' / 'Ã‡' / 'Å“' double-encoded)
+        mixed_payload = (
+            b"1\n"
+            b"00:00:15,115 --> 00:00:18,310\n"
+            b"<i>sur ma fa\xc3\x83\xc2\xa7on de travailler \xc3\x83\xc2\xa0 c\xc3\x85\xe2\x80\x9cur ouvert.</i>\n\n"
+            b"2\n"
+            b"00:00:21,015 --> 00:00:25,320\n"
+            b"Je connais votre r\xc3\xa9putation. \xc3\x83\xe2\x80\xa1a marche, \xc3\x83\xe2\x80\xb0videmment !\n"
+        )
+        repaired = normalize_subtitle_bytes(mixed_payload)
+        self.assertIn("sur ma façon de travailler à cœur ouvert.", repaired)
+        self.assertIn("Je connais votre réputation. Ça marche, Évidemment !", repaired)
+        self.assertNotIn("Ã", repaired)
+        self.assertNotIn("Å", repaired)
+
 
 if __name__ == "__main__":
     unittest.main()

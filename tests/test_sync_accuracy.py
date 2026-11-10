@@ -270,6 +270,244 @@ class TestSyncAccuracy(unittest.TestCase):
         synced_text = Path(synced_path).read_text(encoding="utf-8")
         self.assertIn("Ça doit être bon", synced_text)
 
+    def test_08_wall_to_wall_dense_dialogue_act_alignment(self):
+        """Wall-to-wall 85s abutting dialogue act (0.00s gaps, S01E08 regression) locks via vocal attacks without +5.2s edge aliasing."""
+        from subsync.synchro import aligner, vad
+
+        frame_hz = 100
+        total_dur_s = 420.0
+        ref_env = [0.0] * int(total_dur_s * frame_hz)
+        ref_ivs = []
+        sub_ivs = []
+
+        def _add_speech(s: float, e: float, amp: float = 0.92):
+            ref_ivs.append((s, e))
+            i0 = max(0, int(round(s * frame_hz)))
+            i1 = min(len(ref_env), int(round(e * frame_hz)))
+            for k in range(i0, i1):
+                ref_env[k] = max(ref_env[k], amp)
+
+        # Acts 0 & 1: true offset +1.30s
+        for base_t in (20.0, 95.0):
+            t_cur = base_t
+            for idx in range(12):
+                dur = 1.8 + (idx % 3) * 0.5
+                sub_ivs.append((t_cur, t_cur + dur))
+                _add_speech(t_cur + 1.30, t_cur + dur + 1.30)
+                t_cur += dur + 0.85 + (idx % 2) * 0.45
+
+        # Act 2 (S01E08 minute-20 pattern): 32 abutting subtitles (gap = 0.00s) over 83s at true offset +2.50s,
+        # with short first utterance + trailing laugh [288.2..291.2s] before dead silence [291.3..297.0s].
+        t_cur = 200.0
+        for idx in range(32):
+            dur = 2.1 + (idx % 4) * 0.35
+            s_sub, e_sub = t_cur, t_cur + dur
+            sub_ivs.append((s_sub, e_sub))
+            if idx == 0:
+                _add_speech(s_sub + 2.50, s_sub + 2.95)
+            else:
+                _add_speech(s_sub + 2.50, e_sub + 2.50 - 0.24)
+            t_cur = e_sub
+        # Trailing laugh right after Act 2 that would fool pure boxcar NCC into shifting +2.7s late
+        _add_speech(t_cur + 2.80, t_cur + 5.60, amp=0.55)
+
+        # Act 3: true offset +2.50s
+        t_cur = 305.0
+        for idx in range(14):
+            dur = 1.9 + (idx % 3) * 0.4
+            sub_ivs.append((t_cur, t_cur + dur))
+            _add_speech(t_cur + 2.50, t_cur + dur + 2.50)
+            t_cur += dur + 0.80
+
+        ref_ivs.sort()
+        res = aligner.align_intervals_and_envelopes(
+            sub_intervals=sub_ivs,
+            ref_envelope=ref_env,
+            ref_intervals=ref_ivs,
+            frame_hz=frame_hz,
+        )
+        self.assertTrue(res.correlated)
+        # Check midpoint of the dense wall-to-wall act (t_sub = 240.0s -> true t_ref = 242.50s)
+        pred_mid = res.formula.getY(240.0)
+        self.assertLessEqual(abs(pred_mid - 242.50), 0.10, f"Dense act drifted: got {pred_mid - 240.0:+.3f}s instead of +2.50s")
+
+    def test_09_second_order_anti_spike_regularization(self):
+        """Interior short act with periodic decoy peak cannot create an isolated ping-pong offset spike."""
+        from subsync.synchro import aligner
+
+        frame_hz = 100
+        total_dur_s = 460.0
+        ref_env = [0.0] * int(total_dur_s * frame_hz)
+        ref_ivs = []
+        sub_ivs = []
+
+        def _add_speech(s: float, e: float, amp: float = 0.90):
+            ref_ivs.append((s, e))
+            i0 = max(0, int(round(s * frame_hz)))
+            i1 = min(len(ref_env), int(round(e * frame_hz)))
+            for k in range(i0, i1):
+                ref_env[k] = max(ref_env[k], amp)
+
+        # 5 acts all truly at +1.20s, with a rhythmic decoy at +4.60s on Act 2
+        act_starts = [20.0, 105.0, 200.0, 260.0, 355.0]
+        for a_idx, t0 in enumerate(act_starts):
+            t_cur = t0
+            n_cues = 6 if a_idx == 2 else 14
+            for c_idx in range(n_cues):
+                dur = 1.6 + (c_idx % 3) * 0.35
+                sub_ivs.append((t_cur, t_cur + dur))
+                _add_speech(t_cur + 1.20, t_cur + dur + 1.20, amp=0.80 if a_idx == 2 else 0.95)
+                if a_idx == 2:
+                    _add_speech(t_cur + 4.60, t_cur + dur + 4.60, amp=0.95)
+                t_cur += dur + (1.60 if a_idx == 2 else 0.85)
+
+        ref_ivs.sort()
+        res = aligner.align_intervals_and_envelopes(
+            sub_intervals=sub_ivs,
+            ref_envelope=ref_env,
+            ref_intervals=ref_ivs,
+            frame_hz=frame_hz,
+        )
+        self.assertTrue(res.correlated)
+        pred_act2 = res.formula.getY(210.0)
+        self.assertLessEqual(abs(pred_act2 - 211.20), 0.10, f"Isolated spike was not suppressed: {pred_act2 - 210.0:+.3f}s")
+
+    def test_10_stage4_verify_and_heal_executes_and_heals(self):
+        """Stage 4 Subtitles.verify_and_heal_with_vad runs cleanly without error and heals an unaligned dialogue window."""
+        from subsync.compat_pysubs2 import SSAEvent
+        from subsync.subtitle import Subtitles
+
+        frame_hz = 100
+        total_dur_s = 360.0
+        ref_env = [0.0] * int(total_dur_s * frame_hz)
+        ref_ivs = []
+        subs = Subtitles()
+        gt_starts = []
+
+        for w_idx, base_t in enumerate((20.0, 95.0, 175.0, 260.0)):
+            t_cur = base_t
+            injected_err = -1.40 if w_idx == 2 else 0.0
+            for c_idx in range(10):
+                dur = 1.7 + (c_idx % 3) * 0.3
+                s_gt, e_gt = t_cur, t_cur + dur
+                ref_ivs.append((s_gt, e_gt))
+                for k in range(int(round(s_gt * frame_hz)), int(round(e_gt * frame_hz))):
+                    ref_env[k] = 0.95
+                ev = SSAEvent(
+                    start=int(round((s_gt + injected_err) * 1000.0)),
+                    end=int(round((e_gt + injected_err) * 1000.0)),
+                    text=f"Line {w_idx}-{c_idx}",
+                )
+                subs.events.append(ev)
+                gt_starts.append((w_idx, s_gt))
+                t_cur += dur + 1.50
+
+        healed_events, verified_wins, total_wins = subs.verify_and_heal_with_vad(
+            ref_env, ref_intervals=ref_ivs, frame_hz=frame_hz
+        )
+        self.assertEqual(healed_events, 10)
+        self.assertGreaterEqual(verified_wins, 4)
+        for ev, (w_idx, s_gt) in zip(subs.events, gt_starts):
+            err = abs((ev.start / 1000.0) - s_gt)
+            self.assertLessEqual(err, 0.080, f"Window {w_idx} residual error too high: {err:.3f}s")
+
+    def test_11_commercial_break_staircase_preserves_unit_slope(self):
+        """4-plateau commercial-break staircase (+0s -> +10s -> +20s -> +30s across 8 acts) keeps a = 1.0."""
+        from subsync.synchro import aligner
+
+        frame_hz = 100
+        total_dur_s = 1200.0
+        ref_env = [0.0] * int(total_dur_s * frame_hz)
+        ref_ivs = []
+        sub_ivs = []
+
+        # 8 acts grouped into 4 plateaus of 2 acts each: offsets 0.0s, +10.0s, +20.0s, +30.0s
+        plateau_offsets = [0.0, 0.0, 10.0, 10.0, 20.0, 20.0, 30.0, 30.0]
+        for a_idx, off_b in enumerate(plateau_offsets):
+            t_cur = 25.0 + a_idx * 130.0
+            for c_idx in range(14):
+                dur = 1.65 + (c_idx % 4) * 0.40
+                s_sub, e_sub = t_cur, t_cur + dur
+                sub_ivs.append((s_sub, e_sub))
+                s_ref, e_ref = s_sub + off_b, e_sub + off_b
+                ref_ivs.append((s_ref, e_ref))
+                for k in range(int(round(s_ref * frame_hz)), int(round(e_ref * frame_hz))):
+                    ref_env[k] = 0.95
+                t_cur += dur + 0.90 + (c_idx % 2) * 0.35
+
+        res = aligner.align_intervals_and_envelopes(
+            sub_intervals=sub_ivs,
+            ref_envelope=ref_env,
+            ref_intervals=ref_ivs,
+            frame_hz=frame_hz,
+            allow_drift=True,
+        )
+        self.assertTrue(res.correlated)
+        self.assertAlmostEqual(res.a, 1.0, places=5, msg=f"False linear drift fitted to commercial staircase: a={res.a}")
+
+    def test_12_sdh_non_speech_cues_excluded_from_envelope(self):
+        """Pure SDH music/SFX cues ([MUSIQUE], ♪♪, (Soupire)) are excluded from intervals while mixed cues remain."""
+        from subsync.compat_pysubs2 import SSAEvent
+        from subsync.subtitle import Subtitles
+        from subsync.synchro import vad
+
+        subs = Subtitles()
+        subs.events = [
+            SSAEvent(start=1000, end=3000, text="[MUSIQUE DRAMATIQUE]"),
+            SSAEvent(start=4000, end=6000, text="♪♪ La la ♪♪"),
+            SSAEvent(start=7000, end=9000, text="(Soupire)"),
+            SSAEvent(start=10000, end=12500, text="[Il soupire] Bonjour Elizabeth."),
+            SSAEvent(start=14000, end=16000, text="On doit partir maintenant."),
+        ]
+        ivs = vad.subtitles_to_intervals(subs, update_global_state=False)
+        self.assertEqual(len(ivs), 2)
+        self.assertAlmostEqual(ivs[0][0], 10.0, places=2)
+        self.assertAlmostEqual(ivs[1][0], 14.0, places=2)
+        self.assertEqual(len(subs.events), 5)
+
+    def test_13_destack_zero_duration_clusters_s09e02_regression(self):
+        """Stacked 0ms Mandarin translation cues (S09E02) are unstacked into non-overlapping >=350ms cues."""
+        from subsync.compat_pysubs2 import SSAEvent
+        from subsync.subtitle import Subtitles, _destack_zero_duration_clusters
+
+        subs = Subtitles()
+        subs.events.append(SSAEvent(start=717000, end=719235, text="Previous English line."))
+        for idx in range(13):
+            subs.events.append(SSAEvent(start=787247, end=787247, text=f"Mandarin line {idx + 1} translated."))
+        subs.events.append(SSAEvent(start=787247, end=789500, text="Next English line after Mandarin scene."))
+
+        fixed = _destack_zero_duration_clusters(
+            subs.events,
+            ref_intervals=[(721.27, 745.0), (746.0, 780.51)],
+        )
+        self.assertEqual(fixed, 13)
+        for i in range(len(subs.events)):
+            dur_ms = subs.events[i].end - subs.events[i].start
+            self.assertGreaterEqual(dur_ms, 350, f"Cue {i} duration < 350ms: {dur_ms}ms")
+            if i > 0:
+                self.assertGreaterEqual(
+                    subs.events[i].start,
+                    subs.events[i - 1].end,
+                    f"Cue {i} overlaps cue {i - 1}",
+                )
+
+    def test_14_expanded_french_credit_watermarks_cleaned(self):
+        """French translator credit lines ('Sous-titres traduits par :', 'Traduction :', 'Resynchro') are stripped."""
+        from subsync.compat_pysubs2 import SSAEvent
+        from subsync.subtitle import Subtitles
+
+        subs = Subtitles()
+        subs.events = [
+            SSAEvent(start=1000, end=3000, text="Bonjour Raymond."),
+            SSAEvent(start=4000, end=6000, text="Sous-titres traduits par : Sorrento"),
+            SSAEvent(start=7000, end=9000, text="Traduction : Equipe Addic7ed"),
+            SSAEvent(start=10000, end=48000, text="Resynchro , corrected by Norvegian"),
+            SSAEvent(start=50000, end=52000, text="   "),
+        ]
+        subs.cleanWatermarks()
+        self.assertEqual(len(subs.events), 1)
+        self.assertEqual(subs.events[0].text, "Bonjour Raymond.")
+
 
 if __name__ == "__main__":
     unittest.main()

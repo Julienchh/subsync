@@ -502,6 +502,17 @@ class SSAFile(MutableSequence):
         """Load subtitles from a file path."""
         text = None
         encodings_to_try = []
+        try:
+            with open(path, "rb") as bfp:
+                head_b = bfp.read(4)
+            if head_b.startswith(b"\xff\xfe\x00\x00"):
+                encodings_to_try.append("utf-32-le")
+            elif head_b.startswith(b"\x00\x00\xfe\xff"):
+                encodings_to_try.append("utf-32-be")
+            elif head_b.startswith((b"\xff\xfe", b"\xfe\xff")):
+                encodings_to_try.append("utf-16")
+        except OSError:
+            pass
         if encoding:
             if encoding.lower().replace("-", "") == "utf8":
                 encodings_to_try.append("utf-8-sig")
@@ -543,6 +554,12 @@ class SSAFile(MutableSequence):
         """Parse subtitles from a string."""
         if string.startswith("\ufeff"):
             string = string[1:]
+        try:
+            from subsync.download.normalizer import repair_mojibake_text
+
+            string = repair_mojibake_text(string)
+        except Exception:
+            pass
 
         fmt = format_.lower() if format_ else _autodetect_format(string)
         subs = cls()

@@ -131,10 +131,21 @@ class FormulaLine(object):
 
     def __eq__(self, other):
         if isinstance(other, FormulaLine):
-            return math.isclose(self.a, other.a, rel_tol=1e-6, abs_tol=1e-6) and math.isclose(
-                self.b, other.b, rel_tol=1e-6, abs_tol=1e-6
+            if not (
+                math.isclose(self.a, other.a, rel_tol=1e-6, abs_tol=1e-6)
+                and math.isclose(self.b, other.b, rel_tol=1e-6, abs_tol=1e-6)
+            ):
+                return False
+            if len(self.piecewise_anchors) != len(other.piecewise_anchors):
+                return False
+            return all(
+                math.isclose(px1, px2, rel_tol=1e-6, abs_tol=1e-4)
+                and math.isclose(py1, py2, rel_tol=1e-6, abs_tol=1e-4)
+                for (px1, py1), (px2, py2) in zip(self.piecewise_anchors, other.piecewise_anchors)
             )
         if isinstance(other, (tuple, list)) and len(other) == 2:
+            if self.piecewise_anchors:
+                return False
             return math.isclose(self.a, float(other[0]), rel_tol=1e-6, abs_tol=1e-6) and math.isclose(
                 self.b, float(other[1]), rel_tol=1e-6, abs_tol=1e-6
             )
@@ -372,25 +383,30 @@ def get_fast_corr_lib():
 
     so_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_fast_corr.so")
     if not os.path.isfile(so_path):
+        tmp_so_path = f"{so_path}.{os.getpid()}.tmp"
         try:
             with tempfile.NamedTemporaryFile("w", suffix=".c", delete=False) as tf:
                 tf.write(_C_SOURCE)
                 c_path = tf.name
             try:
                 proc = subprocess.run(
-                    ["gcc", "-O3", "-shared", "-fPIC", c_path, "-o", so_path, "-lm"],
+                    ["gcc", "-O3", "-shared", "-fPIC", c_path, "-o", tmp_so_path, "-lm"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=False,
                     timeout=15,
                 )
-                if proc.returncode != 0:
+                if proc.returncode == 0 and os.path.isfile(tmp_so_path):
+                    os.replace(tmp_so_path, so_path)
+                else:
                     logger.debug("gcc compilation of _fast_corr.so returned %d", proc.returncode)
             finally:
-                try:
-                    os.unlink(c_path)
-                except OSError:
-                    pass
+                for p_rm in (c_path, tmp_so_path):
+                    try:
+                        if os.path.exists(p_rm):
+                            os.unlink(p_rm)
+                    except OSError:
+                        pass
         except Exception as exc:
             logger.debug("Could not compile _fast_corr.so: %s", exc)
 
@@ -871,7 +887,7 @@ def _build_vocal_attack_signal(
     ref_intervals: Optional[Sequence[Tuple[float, float]]],
     frame_hz: int = 100,
 ):
-    """Construct a 100 Hz Vocal Attack impulse signal from reference envelope and speech intervals."""
+    """Construct a 100 Hz Vocal Attack impulse signal from reference envelope, speech intervals, and log-RMS onset flux."""
     n = len(ref_envelope)
     if n == 0:
         return []
@@ -884,6 +900,14 @@ def _build_vocal_attack_signal(
         pad_s = np.pad(smooth, (win, 0), mode="edge")
         prev_min = np.min(sliding_window_view(pad_s[:-1], win), axis=1)
         rise = np.where((smooth > 0.30) & ((smooth - prev_min) > 0.20), smooth - prev_min, 0.0)
+        try:
+            from subsync.synchro import ai_engine
+
+            att_env = ai_engine.get_last_attack_envelope()
+            if att_env is not None and len(att_env) == n:
+                rise = np.maximum(rise, np.asarray(att_env, dtype=np.float64))
+        except Exception:
+            pass
         if ref_intervals:
             for idx, (rs, re_t) in enumerate(ref_intervals):
                 if re_t - rs < 0.12:
@@ -919,18 +943,35 @@ def _ncc_curve_act_np(
     next_start: Optional[float],
     pad_frames: int,
     frame_hz: int = 100,
+    ref_attack_arr=None,
 ):
-    """Compute unbiased, locally-normalized cross-correlation curve C(lag) over [-pad_frames, +pad_frames]."""
+    """Compute hybrid locally-normalized cross-correlation curve C(lag) over [-pad_frames, +pad_frames].
+
+    Blends speech-activity envelope NCC with utterance-start vocal-attack onset NCC
+    weighted adaptively by dialogue duty cycle so wall-to-wall monologues / continuous
+    dialogues (e.g. 90%+ subtitle coverage with 0.0s gaps) never suffer boxcar edge blindness.
+    """
     t0, t1 = act_scaled[0][0], act_scaled[-1][1]
-    margin_l = min(4.0, max(1.5, 0.45 * (t0 - prev_end))) if prev_end is not None else min(4.0, max(1.0, t0))
-    margin_r = min(4.0, max(1.5, 0.45 * (next_start - t1))) if next_start is not None else 4.0
+    act_span = max(1.0, t1 - t0)
+    spoken_dur = sum(max(0.0, e - s) for s, e in act_scaled)
+    raw_duty = min(1.0, spoken_dur / act_span)
+
+    max_m = 6.5 if raw_duty > 0.75 else 4.0
+    ratio_m = 0.65 if raw_duty > 0.75 else 0.45
+    margin_l = (
+        min(max_m, max(1.5, ratio_m * (t0 - prev_end)))
+        if prev_end is not None
+        else min(max_m, max(1.0, t0))
+    )
+    margin_r = min(max_m, max(1.5, ratio_m * (next_start - t1))) if next_start is not None else max_m
     w_start = max(0.0, t0 - margin_l)
     w_end = max(w_start + 10.0, t1 + margin_r)
 
+    notch_s = 0.18 if raw_duty > 0.75 else 0.08
     seg_rel: List[Tuple[float, float]] = []
     for k, (s, e) in enumerate(act_scaled):
-        if k + 1 < len(act_scaled) and act_scaled[k + 1][0] - e < 0.08 and (e - s) > 0.40:
-            e_adj = e - 0.08
+        if k + 1 < len(act_scaled) and act_scaled[k + 1][0] - e < 0.10 and (e - s) > 0.55:
+            e_adj = e - notch_s
         else:
             e_adj = e
         seg_rel.append((s - w_start, e_adj - w_start))
@@ -969,7 +1010,90 @@ def _ncc_curve_act_np(
     r_sum = ps1[w_len : w_len + 2 * pad_frames + 1] - ps1[: 2 * pad_frames + 1]
     r_sq = ps2[w_len : w_len + 2 * pad_frames + 1] - ps2[: 2 * pad_frames + 1]
     r_var = np.maximum(1e-9, r_sq - (r_sum * r_sum) / float(w_len))
-    return dots / (np.sqrt(r_var) * w_norm)
+    c_boxcar = dots / (np.sqrt(r_var) * w_norm)
+
+    if ref_attack_arr is None or len(act_scaled) < 3:
+        return c_boxcar
+
+    # Build 100 Hz subtitle sentence-onset impulse template with symmetric Gaussian lead tolerance
+    # (centered at s + 25ms, pre-lead ramp down to -120ms, post-onset decay up to +300ms)
+    w_onset = np.zeros(w_len, dtype=np.float64)
+    pre_f = max(2, int(round(0.12 * frame_hz)))
+    post_f = max(3, int(round(0.30 * frame_hz)))
+    pre_ramp = np.exp(-0.5 * (np.linspace(-pre_f, -1, pre_f, dtype=np.float64) / (0.055 * frame_hz)) ** 2)
+    decay = np.linspace(1.0, 0.25, post_f, dtype=np.float64)
+    pulse_kernel = np.concatenate([pre_ramp, decay])
+    k_len = len(pulse_kernel)
+    last_s = -999.0
+    for k, (s, _) in enumerate(act_scaled):
+        if s - last_s < 0.40:
+            continue
+        last_s = s
+        prev_e = act_scaled[k - 1][1] if k > 0 else -999.0
+        pw = 1.0 if (s - prev_e) >= 0.20 else 0.70
+        f_center = int(round((s + 0.025 - w_start) * frame_hz))
+        f0 = f_center - pre_f
+        f1 = f0 + k_len
+        c_f0 = max(0, f0)
+        c_f1 = min(w_len, f1)
+        if c_f1 > c_f0:
+            k0 = c_f0 - f0
+            k1 = k0 + (c_f1 - c_f0)
+            w_onset[c_f0:c_f1] = np.maximum(w_onset[c_f0:c_f1], pulse_kernel[k0:k1] * pw)
+
+    o_zero = w_onset - w_onset.mean()
+    o_norm = float(np.linalg.norm(o_zero))
+    if o_norm < 1e-9:
+        return c_boxcar
+
+    a_slice = np.zeros(r1 - r0, dtype=np.float64)
+    ca1 = min(len(ref_attack_arr), r1)
+    if ca1 > c0:
+        a_slice[c0 - r0 : ca1 - r0] = ref_attack_arr[c0:ca1]
+
+    dots_o = np.fft.irfft(
+        np.fft.rfft(a_slice, n_fft) * np.conj(np.fft.rfft(o_zero, n_fft)), n_fft
+    )[: 2 * pad_frames + 1]
+    pa1 = np.concatenate([[0.0], np.cumsum(a_slice)])
+    pa2 = np.concatenate([[0.0], np.cumsum(a_slice * a_slice)])
+    a_sum = pa1[w_len : w_len + 2 * pad_frames + 1] - pa1[: 2 * pad_frames + 1]
+    a_sq = pa2[w_len : w_len + 2 * pad_frames + 1] - pa2[: 2 * pad_frames + 1]
+    a_var = np.maximum(1e-9, a_sq - (a_sum * a_sum) / float(w_len))
+    c_onset = dots_o / (np.sqrt(a_var) * o_norm)
+
+    # Blend onset correlation from 18% (sparse dialogue) up to 52% (wall-to-wall continuous dialogue)
+    alpha = min(0.52, max(0.18, 0.18 + 1.15 * max(0.0, raw_duty - 0.65)))
+    return (1.0 - alpha) * c_boxcar + alpha * np.maximum(-0.20, c_onset)
+
+
+def _act_vocal_coverage(
+    ref_arr,
+    act_scaled: Sequence[Tuple[float, float]],
+    lag_s: float,
+    frame_hz: int = 100,
+) -> float:
+    """Return fraction of subtitle intervals in `act_scaled` that overlap active speech at `lag_s`."""
+    n_ref = len(ref_arr)
+    if n_ref == 0 or not act_scaled:
+        return 0.0
+    hits = 0
+    valid = 0
+    margin_f = max(1, int(round(0.10 * frame_hz)))
+    for s0, e0 in act_scaled:
+        s = s0 + lag_s
+        e = e0 + lag_s
+        if e <= 0.0 or e <= s:
+            continue
+        i0 = max(0, min(n_ref, int(round(s * frame_hz))))
+        i1 = max(0, min(n_ref, int(round(e * frame_hz))))
+        if i1 <= i0:
+            continue
+        valid += 1
+        m0 = max(0, i0 - margin_f)
+        m1 = min(n_ref, i1 + margin_f)
+        if float(np.max(ref_arr[m0:m1])) >= 0.35 and float(np.mean(ref_arr[i0:i1])) >= 0.16:
+            hits += 1
+    return (float(hits) / float(valid)) if valid > 0 else 0.0
 
 
 def _refine_act_vocal_attack(
@@ -1056,11 +1180,13 @@ def _analyze_episode_windows(
         dur = cur_scaled[-1][1] - cur_scaled[0][0]
         if (
             (cur_scaled[0][0] < 120.0 and gap >= 6.0 and len(cur_scaled) >= 4)
+            or (gap >= 8.0 and len(cur_scaled) >= 2)
             or (gap >= 6.0 and len(cur_scaled) >= 5 and dur >= 14.0)
             or (gap >= 3.5 and len(cur_scaled) >= 7 and dur >= 22.0)
             or (gap >= 2.2 and len(cur_scaled) >= 10 and dur >= 38.0)
             or (dur >= 85.0 and gap >= 1.4)
-            or dur >= 130.0
+            or (dur >= 130.0 and gap >= 0.45)
+            or dur >= 180.0
         ):
             acts_orig.append(cur_orig)
             acts_scaled.append(cur_scaled)
@@ -1084,6 +1210,10 @@ def _analyze_episode_windows(
     if np is not None:
         pad_frames = max(int(round(75.0 * frame_hz)), min(max_win_lag, int(round(90.0 * frame_hz))))
         ref_arr = np.asarray(ref_envelope, dtype=np.float64)
+        ref_attack_arr = np.asarray(
+            _build_vocal_attack_signal(ref_envelope, ref_intervals, frame_hz=frame_hz),
+            dtype=np.float64,
+        )
         curves = []
         for k in range(num_acts):
             prev_end = acts_scaled[k - 1][-1][1] if k > 0 else None
@@ -1096,6 +1226,7 @@ def _analyze_episode_windows(
                     next_start,
                     pad_frames=pad_frames,
                     frame_hz=frame_hz,
+                    ref_attack_arr=ref_attack_arr,
                 )
             )
 
@@ -1119,12 +1250,12 @@ def _analyze_episode_windows(
                     abs_diff <= 0.35,
                     0.05 + 0.14 * abs_diff,
                     np.where(
-                        abs_diff <= 2.50,
-                        0.095 + 0.015 * abs_diff,
+                        (diff_mat >= -2.50) & (diff_mat <= 2.50),
+                        0.095 + 0.018 * abs_diff,
                         np.where(
-                            (diff_mat >= -3.5) & (diff_mat <= 15.0),
-                            0.125 + 0.008 * abs_diff,
-                            0.28 + 0.020 * abs_diff,
+                            (diff_mat >= -15.0) & (diff_mat <= 15.0),
+                            0.135 + 0.010 * abs_diff,
+                            0.28 + 0.022 * abs_diff,
                         ),
                     ),
                 ),
@@ -1136,12 +1267,12 @@ def _analyze_episode_windows(
                     abs_diff <= 0.35,
                     0.04 + 0.10 * abs_diff,
                     np.where(
-                        abs_diff <= 2.50,
-                        0.072 + 0.010 * abs_diff,
+                        (diff_mat >= -2.50) & (diff_mat <= 2.50),
+                        0.072 + 0.012 * abs_diff,
                         np.where(
-                            (diff_mat >= -4.5) & (diff_mat <= 18.0),
-                            0.085 + 0.005 * abs_diff,
-                            0.22 + 0.018 * abs_diff,
+                            (diff_mat >= -18.0) & (diff_mat <= 18.0),
+                            0.092 + 0.006 * abs_diff,
+                            0.24 + 0.020 * abs_diff,
                         ),
                     ),
                 ),
@@ -1196,6 +1327,7 @@ def _analyze_episode_windows(
                     next_s0,
                     pad_frames=pad_frames,
                     frame_hz=frame_hz,
+                    ref_attack_arr=ref_attack_arr,
                 )
                 lo0 = max(0, int(round((cb0 - 4.0) * frame_hz)) + pad_frames)
                 hi0 = min(
@@ -1207,11 +1339,6 @@ def _analyze_episode_windows(
                     coarse_path[0] = ((best0 - pad_frames) / float(frame_hz), float(c0_clean[best0]))
 
         # 3b. Plateau-Aware Consensus & Change-Point Stabilization:
-        # - If no single act or consecutive pair of acts has a genuine cut shift relative to the
-        #   global consensus peak `best_const_lag`, lock all post-recap acts to `best_const_lag`.
-        # - Otherwise, group consecutive acts with consistent lags (within <= 0.25s) into plateaus
-        #   and lock each plateau to its joint summed-NCC peak so intra-plateau noise is eliminated
-        #   while genuine multi-scene shifts (e.g. -0.58s -> -1.60s -> +0.22s on S01E04) are preserved.
         start_cons_idx = 1 if (num_acts >= 2 and coarse_path[0][0] < -10.0) else 0
         if num_acts - start_cons_idx >= 2:
             sum_curve = np.sum([curves[w] for w in range(start_cons_idx, num_acts)], axis=0)
@@ -1231,7 +1358,7 @@ def _analyze_episode_windows(
             devs = [coarse_path[w][0] - best_const_lag for w in range(num_acts)]
 
             has_single_break = any(
-                gains[w] > 0.12 and abs(devs[w]) > 0.65
+                gains[w] > 0.14 and abs(devs[w]) > 0.70 and len(acts_scaled[w]) >= 8
                 for w in range(start_cons_idx, num_acts)
             )
             has_plateau_break = any(
@@ -1247,49 +1374,135 @@ def _analyze_episode_windows(
                     f_idx = lo_c + int(np.argmax(curves[w][lo_c : hi_c + 1]))
                     coarse_path[w] = (best_const_lag, float(curves[w][f_idx]))
             else:
-                # Group consecutive acts within <= 0.25s into coherent plateaus and lock each plateau's lag
-                p_start = start_cons_idx
-                while p_start < num_acts:
-                    p_end = p_start + 1
-                    while (
-                        p_end < num_acts
-                        and abs(coarse_path[p_end][0] - coarse_path[p_end - 1][0]) <= 0.25
-                        and abs(coarse_path[p_end][0] - coarse_path[p_start][0]) <= 0.35
-                    ):
-                        p_end += 1
-                    if p_end - p_start >= 2:
-                        p_lags = [coarse_path[w][0] for w in range(p_start, p_end)]
-                        p_med = sorted(p_lags)[len(p_lags) // 2]
-                        p_center_idx = int(round(p_med * frame_hz)) + pad_frames
-                        p_lo = max(0, p_center_idx - int(round(0.30 * frame_hz)))
-                        p_hi = min(2 * pad_frames, p_center_idx + int(round(0.30 * frame_hz)))
-                        if p_hi > p_lo:
-                            p_sum = np.sum([curves[w][p_lo : p_hi + 1] for w in range(p_start, p_end)], axis=0)
-                            p_best_idx = p_lo + int(np.argmax(p_sum))
-                            p_best_lag = (p_best_idx - pad_frames) / float(frame_hz)
-                            for w in range(p_start, p_end):
-                                coarse_path[w] = (p_best_lag, float(curves[w][p_best_idx]))
-                    p_start = p_end
+                def _lock_plateaus() -> None:
+                    p_start = start_cons_idx
+                    while p_start < num_acts:
+                        p_end = p_start + 1
+                        while (
+                            p_end < num_acts
+                            and abs(coarse_path[p_end][0] - coarse_path[p_end - 1][0]) <= 0.25
+                            and abs(coarse_path[p_end][0] - coarse_path[p_start][0]) <= 0.35
+                        ):
+                            p_end += 1
+                        if p_end - p_start >= 2:
+                            p_lags = [coarse_path[w][0] for w in range(p_start, p_end)]
+                            p_med = sorted(p_lags)[len(p_lags) // 2]
+                            p_center_idx = int(round(p_med * frame_hz)) + pad_frames
+                            p_lo = max(0, p_center_idx - int(round(0.30 * frame_hz)))
+                            p_hi = min(2 * pad_frames, p_center_idx + int(round(0.30 * frame_hz)))
+                            if p_hi > p_lo:
+                                p_sum = np.sum([curves[w][p_lo : p_hi + 1] for w in range(p_start, p_end)], axis=0)
+                                p_best_idx = p_lo + int(np.argmax(p_sum))
+                                p_best_lag = (p_best_idx - pad_frames) / float(frame_hz)
+                                for w in range(p_start, p_end):
+                                    coarse_path[w] = (p_best_lag, float(curves[w][p_best_idx]))
+                        p_start = p_end
 
-                # 3c. Post-Viterbi Local Peak Self-Healing:
-                # If any act (>= 5 subs) was pulled away from a strong, unambiguous local peak
-                # inside the causally valid neighborhood of its neighbors, heal it to its true peak.
-                for w in range(start_cons_idx, num_acts):
-                    if len(acts_scaled[w]) < 5:
-                        continue
+                _lock_plateaus()
+
+                # 3d. Second-Order Anti-Spike Regularizer (runs BEFORE fine local refinement):
+                # Eliminate non-physical 1-act (or 2-short-act) "ping-pong" reversal spikes where
+                # offset jumps outside [min(prev, next), max(prev, next)] and immediately jumps back.
+                for w in range(start_cons_idx + 1, num_acts - 2):
+                    prev_lag = coarse_path[w - 1][0]
+                    next2_lag = coarse_path[w + 2][0]
+                    l1, sc1 = coarse_path[w]
+                    l2, sc2 = coarse_path[w + 1]
+                    span_pair = acts_scaled[w + 1][-1][1] - acts_scaled[w][0][0]
+                    lo_p, hi_p = min(prev_lag, next2_lag), max(prev_lag, next2_lag)
+                    if (
+                        span_pair <= 110.0
+                        and abs(l1 - l2) <= 0.45
+                        and (l1 < lo_p - 0.65 or l1 > hi_p + 0.65)
+                        and (l2 < lo_p - 0.65 or l2 > hi_p + 0.65)
+                    ):
+                        lo_i = max(0, int(round((lo_p - 0.35) * frame_hz)) + pad_frames)
+                        hi_i = min(2 * pad_frames, int(round((hi_p + 0.35) * frame_hz)) + pad_frames)
+                        if hi_i > lo_i:
+                            pair_sum = curves[w][lo_i : hi_i + 1] + curves[w + 1][lo_i : hi_i + 1]
+                            best_pi = lo_i + int(np.argmax(pair_sum))
+                            cand_lag = (best_pi - pad_frames) / float(frame_hz)
+                            if (sc1 + sc2) - float(pair_sum[best_pi - lo_i]) < 0.36:
+                                coarse_path[w] = (cand_lag, float(curves[w][best_pi]))
+                                coarse_path[w + 1] = (cand_lag, float(curves[w + 1][best_pi]))
+
+                for w in range(start_cons_idx + 1, num_acts - 1):
+                    prev_lag = coarse_path[w - 1][0]
+                    next_lag = coarse_path[w + 1][0]
                     cur_lag, cur_sc = coarse_path[w]
-                    prev_lag = coarse_path[w - 1][0] if w > start_cons_idx else cur_lag - 3.0
-                    next_lag = coarse_path[w + 1][0] if w + 1 < num_acts else cur_lag + 3.0
-                    lo_bound = min(prev_lag, next_lag, cur_lag) - 3.0
-                    hi_bound = max(prev_lag, next_lag, cur_lag) + 5.0
-                    lo_i = max(0, int(round(lo_bound * frame_hz)) + pad_frames)
-                    hi_i = min(2 * pad_frames, int(round(hi_bound * frame_hz)) + pad_frames)
-                    if hi_i > lo_i:
-                        loc_best_i = lo_i + int(np.argmax(curves[w][lo_i : hi_i + 1]))
-                        loc_best_sc = float(curves[w][loc_best_i])
-                        loc_best_lag = (loc_best_i - pad_frames) / float(frame_hz)
-                        if loc_best_sc >= 0.44 and (loc_best_sc - cur_sc) >= 0.055:
-                            coarse_path[w] = (loc_best_lag, loc_best_sc)
+                    lo_nb, hi_nb = min(prev_lag, next_lag), max(prev_lag, next_lag)
+                    if cur_lag < lo_nb - 0.45 or cur_lag > hi_nb + 0.45:
+                        lo_i = max(0, int(round((lo_nb - 0.35) * frame_hz)) + pad_frames)
+                        hi_i = min(2 * pad_frames, int(round((hi_nb + 0.35) * frame_hz)) + pad_frames)
+                        if hi_i > lo_i:
+                            best_ci = lo_i + int(np.argmax(curves[w][lo_i : hi_i + 1]))
+                            cand_lag = (best_ci - pad_frames) / float(frame_hz)
+                            cand_sc = float(curves[w][best_ci])
+                            vc_cur = _act_vocal_coverage(ref_arr, acts_scaled[w], cur_lag, frame_hz=frame_hz)
+                            vc_cand = _act_vocal_coverage(ref_arr, acts_scaled[w], cand_lag, frame_hz=frame_hz)
+                            keep_spike = (
+                                cur_sc >= 0.58
+                                and (cur_sc - cand_sc) >= 0.22
+                                and vc_cur >= vc_cand + 0.12
+                            )
+                            if not keep_spike:
+                                coarse_path[w] = (cand_lag, cand_sc)
+
+                _lock_plateaus()
+
+                # 3c. Convex-Hull Bounded Local Peak Refinement (runs AFTER plateau locking so local
+                # refinements within <= 0.25s are preserved):
+                # - Inside a coherent plateau (|prev - next| <= 0.45s), stay within ±0.30s of neighbors.
+                # - At a commercial break boundary (|prev - next| > 0.45s), if already locked to one
+                #   neighbor plateau, only switch to the OTHER neighbor plateau (never invent an
+                #   artificial intermediate step in between).
+                # - Short boundary acts (< 10 subs) snap to their adjacent plateau unless strongly distinct.
+                for w in range(start_cons_idx, num_acts):
+                    cur_lag, cur_sc = coarse_path[w]
+                    if start_cons_idx < w < num_acts - 1:
+                        if len(acts_scaled[w]) < 5:
+                            continue
+                        prev_lag = coarse_path[w - 1][0]
+                        next_lag = coarse_path[w + 1][0]
+                        if abs(prev_lag - next_lag) <= 0.45:
+                            lo_bound = min(prev_lag, next_lag) - 0.30
+                            hi_bound = max(prev_lag, next_lag) + 0.30
+                            min_gain = 0.055
+                        elif min(abs(cur_lag - prev_lag), abs(cur_lag - next_lag)) <= 0.25:
+                            other_lag = next_lag if abs(cur_lag - prev_lag) <= abs(cur_lag - next_lag) else prev_lag
+                            lo_bound = other_lag - 0.25
+                            hi_bound = other_lag + 0.25
+                            min_gain = 0.085
+                        else:
+                            lo_bound = min(prev_lag, next_lag) - 0.35
+                            hi_bound = max(prev_lag, next_lag) + 0.35
+                            min_gain = 0.055
+                        lo_i = max(0, int(round(lo_bound * frame_hz)) + pad_frames)
+                        hi_i = min(2 * pad_frames, int(round(hi_bound * frame_hz)) + pad_frames)
+                        if hi_i > lo_i:
+                            loc_best_i = lo_i + int(np.argmax(curves[w][lo_i : hi_i + 1]))
+                            loc_best_sc = float(curves[w][loc_best_i])
+                            loc_best_lag = (loc_best_i - pad_frames) / float(frame_hz)
+                            if loc_best_sc >= 0.42 and (loc_best_sc - cur_sc) >= min_gain:
+                                coarse_path[w] = (loc_best_lag, loc_best_sc)
+                    else:
+                        nb_idx = (w + 1) if (w == start_cons_idx and w + 1 < num_acts) else (w - 1 if w > start_cons_idx else -1)
+                        if nb_idx < 0:
+                            continue
+                        nb_lag = coarse_path[nb_idx][0]
+                        if len(acts_scaled[w]) < 10 and abs(cur_lag - nb_lag) <= 2.20:
+                            nb_i = max(0, min(2 * pad_frames, int(round(nb_lag * frame_hz)) + pad_frames))
+                            nb_sc = float(curves[w][nb_i])
+                            if cur_sc - nb_sc < 0.16:
+                                coarse_path[w] = (nb_lag, nb_sc)
+                        elif len(acts_scaled[w]) >= 12:
+                            lo_i = max(0, int(round((min(cur_lag, nb_lag) - 1.50) * frame_hz)) + pad_frames)
+                            hi_i = min(2 * pad_frames, int(round((max(cur_lag, nb_lag) + 1.50) * frame_hz)) + pad_frames)
+                            if hi_i > lo_i:
+                                loc_best_i = lo_i + int(np.argmax(curves[w][lo_i : hi_i + 1]))
+                                loc_best_sc = float(curves[w][loc_best_i])
+                                if loc_best_sc >= 0.50 and (loc_best_sc - cur_sc) >= 0.14:
+                                    coarse_path[w] = ((loc_best_i - pad_frames) / float(frame_hz), loc_best_sc)
 
         # 4. Stage 2: Zero-Bias Vocal Onset Refinement on each act
         chain: List[dict] = []
@@ -1476,8 +1689,8 @@ def align_intervals_and_envelopes(
             sum(w["score"] for w in win_chain) / float(len(win_chain)) if win_chain else 0.0
         )
 
-        # 3a. Adaptive Linear Drift Pre-Scaling for episodes with progressive drift (e.g. uncut/extended
-        # masters vs broadcast cuts or non-standard speed transfers where offset drifts by >= 5s across the episode)
+        # 3a. Adaptive Linear Drift Pre-Scaling for episodes with true continuous progressive drift
+        # (vs discrete commercial-break step functions where >= 45% of adjacent act transitions are flat plateaus)
         if allow_drift and len(win_chain) >= 6 and np is not None:
             start_d_idx = (
                 1
@@ -1492,62 +1705,71 @@ def align_intervals_and_envelopes(
                 xs_d = np.array([w["x_center"] for w in post_acts], dtype=np.float64)
                 bs_d = np.array([w["b"] for w in post_acts], dtype=np.float64)
                 scs_d = np.array([w["score"] for w in post_acts], dtype=np.float64)
-                pair_slopes = []
-                for i_d in range(len(post_acts)):
-                    for j_d in range(i_d + 1, len(post_acts)):
-                        dx_d = xs_d[j_d] - xs_d[i_d]
-                        if dx_d >= 350.0:
-                            pair_slopes.append((bs_d[j_d] - bs_d[i_d]) / dx_d)
-                slope_cands: List[float] = []
-                if pair_slopes:
-                    med_s = float(np.median(pair_slopes))
-                    if abs(med_s * t_span) >= 5.0 and abs(med_s) <= 0.05:
-                        slope_cands.append(1.0 + med_s)
-                try:
-                    ols_s, _ = np.polyfit(xs_d, bs_d, 1, w=scs_d)
-                    ols_s = float(ols_s)
-                    if abs(ols_s * t_span) >= 5.0 and abs(ols_s) <= 0.05:
-                        if not slope_cands or abs((1.0 + ols_s) - slope_cands[0]) > 0.0004:
-                            slope_cands.append(1.0 + ols_s)
-                except Exception:
-                    pass
+                adj_diffs = np.abs(np.diff(bs_d))
+                frac_flat_adj = float(np.mean(adj_diffs <= 0.35)) if len(adj_diffs) > 0 else 1.0
+                # If >= 45% of adjacent act transitions are flat plateaus (<= 0.35s), the offset pattern
+                # is a piecewise-constant commercial-break staircase (a = 1.0), NOT continuous linear drift!
+                if frac_flat_adj < 0.45:
+                    pair_slopes = []
+                    for i_d in range(len(post_acts)):
+                        for j_d in range(i_d + 1, len(post_acts)):
+                            dx_d = xs_d[j_d] - xs_d[i_d]
+                            if dx_d >= 350.0:
+                                pair_slopes.append((bs_d[j_d] - bs_d[i_d]) / dx_d)
+                    slope_cands: List[float] = []
+                    if pair_slopes:
+                        med_s = float(np.median(pair_slopes))
+                        if abs(med_s * t_span) >= 5.0 and abs(med_s) <= 0.05:
+                            slope_cands.append(1.0 + med_s)
+                    try:
+                        ols_s, _ = np.polyfit(xs_d, bs_d, 1, w=scs_d)
+                        ols_s = float(ols_s)
+                        if abs(ols_s * t_span) >= 5.0 and abs(ols_s) <= 0.05:
+                            if not slope_cands or abs((1.0 + ols_s) - slope_cands[0]) > 0.0004:
+                                slope_cands.append(1.0 + ols_s)
+                    except Exception:
+                        pass
 
-                spread_1 = (
-                    max(w["b"] for w in win_chain[start_d_idx:])
-                    - min(w["b"] for w in win_chain[start_d_idx:])
-                )
-                for cand_a_drift in slope_cands:
-                    cand_chain, cand_tot = _analyze_episode_windows(
-                        ref_envelope=ref_envelope,
-                        ref_intervals=ref_intervals,
-                        sub_intervals=sub_intervals,
-                        scale_a=cand_a_drift,
-                        frame_hz=frame_hz,
-                        max_win_lag=max_win_lag,
+                    spread_1 = (
+                        max(w["b"] for w in win_chain[start_d_idx:])
+                        - min(w["b"] for w in win_chain[start_d_idx:])
                     )
-                    if len(cand_chain) >= 5:
-                        c_start = (
-                            1
-                            if (
-                                cand_chain[0]["x_start"] < 60.0
-                                and (
-                                    cand_chain[0]["b"] < -10.0
-                                    or cand_chain[0]["b"] < cand_chain[1]["b"] - 6.0
+                    for cand_a_drift in slope_cands:
+                        cand_chain, cand_tot = _analyze_episode_windows(
+                            ref_envelope=ref_envelope,
+                            ref_intervals=ref_intervals,
+                            sub_intervals=sub_intervals,
+                            scale_a=cand_a_drift,
+                            frame_hz=frame_hz,
+                            max_win_lag=max_win_lag,
+                        )
+                        if len(cand_chain) >= 5:
+                            c_start = (
+                                1
+                                if (
+                                    cand_chain[0]["x_start"] < 60.0
+                                    and (
+                                        cand_chain[0]["b"] < -10.0
+                                        or cand_chain[0]["b"] < cand_chain[1]["b"] - 6.0
+                                    )
                                 )
+                                else 0
                             )
-                            else 0
-                        )
-                        cand_mean = sum(w["score"] for w in cand_chain) / float(len(cand_chain))
-                        cand_spread = (
-                            max(w["b"] for w in cand_chain[c_start:])
-                            - min(w["b"] for w in cand_chain[c_start:])
-                        )
-                        if cand_mean >= mean_1_score + 0.012 and cand_spread < spread_1 * 0.70:
-                            best_a = cand_a_drift
-                            win_chain = cand_chain
-                            win_tot = cand_tot
-                            mean_1_score = cand_mean
-                            spread_1 = cand_spread
+                            cand_mean = sum(w["score"] for w in cand_chain) / float(len(cand_chain))
+                            cand_bs = [float(w["b"]) for w in cand_chain[c_start:]]
+                            cand_spread = max(cand_bs) - min(cand_bs)
+                            cand_med = float(np.median(cand_bs))
+                            cand_mad = float(np.median(np.abs(np.asarray(cand_bs) - cand_med)))
+                            if (
+                                cand_mean >= mean_1_score + 0.020
+                                and cand_spread <= min(0.85, spread_1 * 0.35)
+                                and cand_mad <= 0.18
+                            ):
+                                best_a = cand_a_drift
+                                win_chain = cand_chain
+                                win_tot = cand_tot
+                                mean_1_score = cand_mean
+                                spread_1 = cand_spread
 
         # Only evaluate canonical PAL/NTSC ratios on full episodes if correlation is still weak (< 0.25 mean),
         # and require a uniform constant offset (spread < 3.0s) across >= 6 acts with > 35% score gain.
@@ -1581,6 +1803,73 @@ def align_intervals_and_envelopes(
             win_chain = best_pal_chain
             win_tot = best_pal_tot
 
+        # 3e. Targeted Faster-Whisper Bilingual Arbitration on ambiguous / wall-to-wall / jump acts
+        if abs(best_a - 1.0) < 1e-4 and len(win_chain) >= 3:
+            try:
+                from subsync.synchro import ai_engine
+
+                if ai_engine.get_last_vad_result() is not None and ai_engine.get_last_pcm_bytes() is not None:
+                    wh_candidates: List[Tuple[float, int]] = []
+                    for k_w, w_item in enumerate(win_chain):
+                        a_subs = w_item["subs"]
+                        if len(a_subs) < 5 or w_item["x_start"] < 5.0 or w_item["b"] < -65.0:
+                            continue
+                        a_dur = max(1.0, a_subs[-1][1] - a_subs[0][0])
+                        a_duty = sum(max(0.0, e - s) for s, e in a_subs) / a_dur
+                        jump_prev = abs(w_item["b"] - win_chain[k_w - 1]["b"]) if k_w > 0 else 0.0
+                        if (
+                            (a_duty >= 0.80 and a_dur >= 35.0)
+                            or w_item["score"] < 0.28
+                            or (jump_prev >= 1.20 and w_item["score"] < 0.44)
+                        ):
+                            prio = (1.0 - float(w_item["score"])) + (0.6 if a_duty >= 0.80 else 0.0)
+                            wh_candidates.append((prio, k_w))
+
+                    wh_candidates.sort(reverse=True)
+                    for _, k_w in wh_candidates[:4]:
+                        w_item = win_chain[k_w]
+                        cur_b_w = float(w_item["b"])
+                        prev_b_w = float(win_chain[k_w - 1]["b"]) if k_w > 0 else cur_b_w
+                        next_b_w = float(win_chain[k_w + 1]["b"]) if k_w + 1 < len(win_chain) else cur_b_w
+                        lo_wh = max(-75.0, min(cur_b_w - 8.0, prev_b_w - 3.0, next_b_w - 3.0))
+                        hi_wh = min(75.0, max(cur_b_w + 8.0, prev_b_w + 3.0, next_b_w + 3.0))
+                        ver = ai_engine.verify_act_offset_with_whisper(
+                            w_item["subs"],
+                            b_current=cur_b_w,
+                            b_min=lo_wh,
+                            b_max=hi_wh,
+                            b_prior=None,
+                            frame_hz=frame_hz,
+                        )
+                        if not ver:
+                            continue
+                        b_wh = float(ver["b"])
+                        lex_wh = int(ver["lexical_hits"])
+                        lex_cur = int(ver["lexical_hits_current"])
+                        anc_cnt = int(ver["anchors_count"])
+                        if abs(b_wh - cur_b_w) < 0.12:
+                            continue
+                        lo_nb_w, hi_nb_w = min(prev_b_w, next_b_w), max(prev_b_w, next_b_w)
+                        creates_spike = (0 < k_w < len(win_chain) - 1) and (
+                            b_wh < lo_nb_w - 0.50 or b_wh > hi_nb_w + 0.50
+                        )
+                        if (
+                            lex_wh >= 3
+                            and anc_cnt >= 5
+                            and lex_wh >= lex_cur + 1
+                            and (not creates_spike or (lex_wh >= 6 and lex_wh >= lex_cur + 3))
+                        ):
+                            old_b_w = cur_b_w
+                            w_item["b"] = b_wh
+                            # Propagate to adjacent low-confidence acts sharing the exact same plateau offset
+                            for nb_idx in (k_w - 1, k_w + 1):
+                                if 0 < nb_idx < len(win_chain):
+                                    nb_item = win_chain[nb_idx]
+                                    if nb_item["score"] < 0.34 and abs(float(nb_item["b"]) - old_b_w) <= 0.25:
+                                        nb_item["b"] = b_wh
+            except Exception as wh_exc:
+                logger.debug("Targeted Whisper act arbitration skipped: %s", wh_exc)
+
         if len(win_chain) >= 2:
             window_offsets_out = [
                 (
@@ -1601,15 +1890,19 @@ def align_intervals_and_envelopes(
 
             b_spread = max(w["b"] for w in win_chain) - min(w["b"] for w in win_chain)
             if b_spread > 0.20 or abs(best_a - 1.0) > 1e-4:
-                # Emit piecewise-linear anchors [(x_start, a*x_start + b_k), (x_end, a*x_end + b_k)]
+                # Emit strictly monotonic piecewise-linear anchors [(x_start, y_start), (x_end, y_end)]
                 # so offset b_k is constant (relative to scale best_a) inside each dialogue scene [x_start, x_end]
                 # and only transitions during the silent gaps between acts/sub-scenes!
+                prev_y1 = -1e9
                 for w in win_chain:
                     x0 = float(w["x_start"])
                     x1 = max(x0 + 0.01, float(w["x_end"]))
                     bk = float(w["b"])
-                    piecewise_anchors.append((x0, best_a * x0 + bk))
-                    piecewise_anchors.append((x1, best_a * x1 + bk))
+                    y0 = max(prev_y1 + 0.02, best_a * x0 + bk)
+                    y1 = max(y0 + 0.01, best_a * x1 + bk)
+                    piecewise_anchors.append((x0, y0))
+                    piecewise_anchors.append((x1, y1))
+                    prev_y1 = y1
 
     # 4. Stage 2: Sub-10ms Fine Boundary Refinement using ref_intervals (for single-line / short tracks)
     inlier_pts: List[Tuple[float, float]] = []

@@ -256,7 +256,7 @@ def synchronize_pair(
                     frame_hz=vad.FRAME_HZ,
                 )
             except Exception as ver_exc:
-                logger.debug("Stage 4 verification & self-healing skipped: %s", ver_exc)
+                logger.warning("Stage 4 verification & self-healing failed: %s", ver_exc, exc_info=True)
             try:
                 refined_count = synced_subs.refine_durations_with_vad(
                     ref_envelope,
@@ -271,7 +271,7 @@ def synchronize_pair(
         raw_ncc, raw_vocal = compute_envelope_sync_metrics(
             sub_intervals, ref_envelope, frame_hz=vad.FRAME_HZ
         )
-        synced_intervals = vad.subtitles_to_intervals(synced_subs)
+        synced_intervals = vad.subtitles_to_intervals(synced_subs, update_global_state=False)
         post_ncc, post_vocal = compute_envelope_sync_metrics(
             synced_intervals, ref_envelope, frame_hz=vad.FRAME_HZ
         )

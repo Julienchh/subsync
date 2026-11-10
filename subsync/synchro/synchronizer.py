@@ -217,7 +217,7 @@ class Synchronizer(object):
                     frame_hz=vad.FRAME_HZ,
                 )
             except Exception as err:
-                logger.debug('verification & self-healing skipped: %r', err)
+                logger.warning('verification & self-healing failed: %r', err, exc_info=True)
             try:
                 synced.refine_durations_with_vad(
                     ref_env,

@@ -16,6 +16,7 @@ Provides:
      (`video_recap_end_s`), and refines scene offsets `b` to millisecond precision.
 """
 
+import hashlib
 import logging
 import math
 import os
@@ -64,7 +65,9 @@ WHISPER_MODEL_DIRS: Tuple[str, ...] = (
     os.path.join(_REPO_ROOT, ".ai_models", "whisper"),
 )
 
-_MODEL_LOCK = threading.Lock()
+_MODEL_LOCK = threading.RLock()
+_CACHE_LOCK = threading.RLock()
+_TLS = threading.local()
 _SILERO_SESSION = None
 _WHISPER_MODEL = None
 
@@ -120,9 +123,16 @@ def _pcm_fingerprint(pcm_bytes: bytes, sample_rate: int = 8000, frame_hz: int = 
     n = len(pcm_bytes)
     if n == 0:
         return (0, sample_rate, frame_hz, 0, 0)
-    mid = n // 2
-    h1 = hash(pcm_bytes[: min(n, 8192)])
-    h2 = hash(pcm_bytes[max(0, mid - 4096) : min(n, mid + 4096)] + pcm_bytes[max(0, n - 8192) :])
+    h = hashlib.blake2b(digest_size=16)
+    h.update(n.to_bytes(8, "little", signed=False))
+    num_slices = 16
+    slice_len = min(4096, max(64, n // num_slices))
+    for k in range(num_slices):
+        pos = min(max(0, n - slice_len), (k * n) // num_slices)
+        h.update(pcm_bytes[pos : pos + slice_len])
+    digest = h.digest()
+    h1 = int.from_bytes(digest[:8], "little", signed=True)
+    h2 = int.from_bytes(digest[8:16], "little", signed=True)
     return (n, int(sample_rate), int(frame_hz), h1, h2)
 
 
@@ -132,44 +142,77 @@ def set_last_pcm_bytes(pcm_bytes: Optional[bytes], sample_rate: int = 8000) -> N
     if pcm_bytes:
         LAST_PCM_BYTES = pcm_bytes
         LAST_SAMPLE_RATE = int(sample_rate)
+        _TLS.last_pcm_bytes = pcm_bytes
+        _TLS.last_sample_rate = int(sample_rate)
+
+
+def restore_vad_state(
+    pcm_bytes: Optional[bytes],
+    sample_rate: int,
+    vad_result: Optional[Tuple[List[float], List[float], List[Tuple[float, float]]]],
+) -> None:
+    """Atomically restore PCM and VAD outputs (used when `vad.extract_speech_envelope` hits its cache)."""
+    global LAST_PCM_BYTES, LAST_SAMPLE_RATE, LAST_VAD_RESULT
+    global LAST_SPEECH_ENVELOPE, LAST_ATTACK_ENVELOPE, LAST_SPEECH_INTERVALS
+    if pcm_bytes is not None:
+        LAST_PCM_BYTES = pcm_bytes
+        LAST_SAMPLE_RATE = int(sample_rate)
+        _TLS.last_pcm_bytes = pcm_bytes
+        _TLS.last_sample_rate = int(sample_rate)
+    if vad_result is not None:
+        LAST_VAD_RESULT = vad_result
+        LAST_SPEECH_ENVELOPE, LAST_ATTACK_ENVELOPE, LAST_SPEECH_INTERVALS = vad_result
+        _TLS.last_vad_result = vad_result
+        _TLS.last_speech_envelope = LAST_SPEECH_ENVELOPE
+        _TLS.last_attack_envelope = LAST_ATTACK_ENVELOPE
+        _TLS.last_speech_intervals = LAST_SPEECH_INTERVALS
 
 
 def get_last_pcm_bytes() -> Optional[bytes]:
     """Return the most recently extracted 8 kHz mono PCM buffer."""
-    return LAST_PCM_BYTES
+    return getattr(_TLS, "last_pcm_bytes", LAST_PCM_BYTES)
 
 
 def get_last_vad_result() -> Optional[Tuple[List[float], List[float], List[Tuple[float, float]]]]:
     """Return the most recent `(speech_env_100hz, attack_env_100hz, speech_intervals)` from Silero VAD."""
-    return LAST_VAD_RESULT
+    return getattr(_TLS, "last_vad_result", LAST_VAD_RESULT)
 
 
 def get_last_attack_envelope() -> Optional[List[float]]:
     """Return the most recent 100 Hz Vocal Attack Envelope from Silero VAD."""
-    return LAST_ATTACK_ENVELOPE
+    return getattr(_TLS, "last_attack_envelope", LAST_ATTACK_ENVELOPE)
 
 
 def set_last_subtitles(sub_events: Sequence[Tuple[float, float, str]], subs_obj: Any = None) -> None:
     """Cache `(start_s, end_s, text)` events from `vad.subtitles_to_intervals` so text is preserved for AI matching."""
     global LAST_SUB_EVENTS, LAST_SUBTITLES_OBJ, _SUB_TEXT_BY_INTERVAL
-    LAST_SUB_EVENTS = [(float(s), float(e), str(t)) for s, e, t in sub_events]
+    evs = [(float(s), float(e), str(t)) for s, e, t in sub_events]
+    LAST_SUB_EVENTS = evs
+    _TLS.last_sub_events = evs
     if subs_obj is not None:
         LAST_SUBTITLES_OBJ = subs_obj
+        _TLS.last_subtitles_obj = subs_obj
     lookup: Dict[Tuple[int, int], str] = {}
-    for s, e, t in LAST_SUB_EVENTS:
-        lookup[(int(round(s * 1000.0)), int(round(e * 1000.0)))] = t
+    for s, e, t in evs:
+        key = (int(round(s * 1000.0)), int(round(e * 1000.0)))
+        if key in lookup and t not in lookup[key]:
+            lookup[key] = f"{lookup[key]} {t}".strip()
+        else:
+            lookup[key] = t
     _SUB_TEXT_BY_INTERVAL = lookup
+    _TLS.sub_text_by_interval = lookup
 
 
 def get_last_sub_events() -> List[Tuple[float, float, str]]:
     """Return cached `(start_s, end_s, text)` events from the last loaded subtitle track."""
-    return list(LAST_SUB_EVENTS)
+    return list(getattr(_TLS, "last_sub_events", LAST_SUB_EVENTS))
 
 
 def enrich_intervals_with_text(
     items: Sequence[Any],
 ) -> List[Tuple[float, float, str]]:
     """Convert `(s, e)`, `(s, e, text)`, or `SSAEvent` sequences into `(start_s, end_s, text)` triples."""
+    lookup = getattr(_TLS, "sub_text_by_interval", _SUB_TEXT_BY_INTERVAL)
     out: List[Tuple[float, float, str]] = []
     for item in items or []:
         if hasattr(item, "start") and hasattr(item, "end"):
@@ -185,7 +228,7 @@ def enrich_intervals_with_text(
             e = float(item.get("end", item.get("e", 0.0)))
             txt = str(item.get("text", "") or "").replace("\n", " ").strip()
             if not txt:
-                txt = _SUB_TEXT_BY_INTERVAL.get((int(round(s * 1000.0)), int(round(e * 1000.0))), "")
+                txt = lookup.get((int(round(s * 1000.0)), int(round(e * 1000.0))), "")
             if e > s >= 0.0:
                 out.append((s, e, txt))
         elif isinstance(item, (tuple, list)) and len(item) >= 2:
@@ -193,7 +236,7 @@ def enrich_intervals_with_text(
             e = float(item[1])
             txt = str(item[2]).replace("\n", " ").strip() if len(item) >= 3 and item[2] is not None else ""
             if not txt:
-                txt = _SUB_TEXT_BY_INTERVAL.get((int(round(s * 1000.0)), int(round(e * 1000.0))), "")
+                txt = lookup.get((int(round(s * 1000.0)), int(round(e * 1000.0))), "")
             if e > s >= 0.0:
                 out.append((s, e, txt))
     out.sort(key=lambda x: (x[0], x[1]))
@@ -343,10 +386,13 @@ def run_silero_vad(
         return None
 
     # Interpolate chunk probabilities (31.25 Hz / 32ms) to 100 Hz (10ms frames)
-    frame_to_chunk = np.arange(num_frames, dtype=np.float32) * (float(target_sr) / float(frame_hz * chunk_size))
+    # Center each 256-sample chunk at (k + 0.5) * 32ms (+16ms) and each 10ms frame at (i + 0.5) * 10ms (+5ms)
+    frame_to_chunk = (np.arange(num_frames, dtype=np.float32) + 0.5) * (
+        float(target_sr) / float(frame_hz * chunk_size)
+    )
     prob_100hz = np.interp(
         frame_to_chunk,
-        np.arange(total_chunks, dtype=np.float32),
+        np.arange(total_chunks, dtype=np.float32) + 0.5,
         flat_probs,
     ).astype(np.float32)
 
@@ -354,7 +400,9 @@ def run_silero_vad(
     speech_env_arr = np.where(prob_100hz >= 0.30, prob_100hz, 0.0).astype(np.float32)
 
     # 2. attack_env_100hz: Vocal Attack Envelope peaking at rising vocal onset of each phrase
-    #    smooth[k] - min(smooth[k-40:k]) when smooth[k] > 0.35 and rise > 0.20
+    #    Combines Silero probability rise with Silero-gated 100 Hz log-RMS vocal onset flux
+    #    so continuous rapid-fire monologues (where Silero stays pinned at ~0.98) still produce
+    #    crisp syllable/sentence onset peaks.
     smooth = np.convolve(prob_100hz, np.full(5, 0.2, dtype=np.float32), mode="same")
     if sliding_window_view is not None and num_frames >= 2:
         padded_smooth = np.pad(smooth, (40, 0), mode="edge")[:-1]
@@ -364,8 +412,34 @@ def run_silero_vad(
             [float(np.min(smooth[max(0, k - 40) : max(1, k)])) for k in range(num_frames)],
             dtype=np.float32,
         )
-    rise = smooth - prev_min
-    attack_env_arr = np.where((smooth > 0.35) & (rise > 0.20), rise, 0.0).astype(np.float32)
+    rise = np.where((smooth > 0.35) & ((smooth - prev_min) > 0.20), smooth - prev_min, 0.0).astype(np.float32)
+
+    spf = max(1, int(round(float(target_sr) / float(frame_hz))))
+    usable_frames = min(num_frames, len(samples_8k) // spf)
+    energy_flux = np.zeros(num_frames, dtype=np.float32)
+    if usable_frames >= 8:
+        frame_mat = samples_8k[: usable_frames * spf].reshape(usable_frames, spf)
+        rms = np.sqrt(np.mean(frame_mat * frame_mat, axis=1) + 1e-10)
+        log_rms = np.log10(np.maximum(rms, 1e-4))
+        smooth_log = np.convolve(log_rms, np.full(3, 1.0 / 3.0, dtype=np.float32), mode="same")
+        if sliding_window_view is not None and usable_frames >= 12:
+            pad_log = np.pad(smooth_log, (12, 0), mode="edge")[:-1]
+            local_floor = sliding_window_view(pad_log, 12).min(axis=1)
+        else:
+            local_floor = np.roll(smooth_log, 4)
+            local_floor[:4] = smooth_log[:4]
+        raw_flux = np.maximum(0.0, smooth_log - local_floor)
+        p95 = float(np.percentile(raw_flux[prob_100hz[:usable_frames] >= 0.35], 95)) if np.any(prob_100hz[:usable_frames] >= 0.35) else 0.0
+        if p95 > 1e-4:
+            norm_flux = np.minimum(1.0, raw_flux / p95)
+            gated_flux = np.where(
+                (prob_100hz[:usable_frames] >= 0.35) & (norm_flux >= 0.28),
+                norm_flux * prob_100hz[:usable_frames],
+                0.0,
+            ).astype(np.float32)
+            energy_flux[:usable_frames] = gated_flux
+
+    attack_env_arr = np.maximum(rise, 0.70 * energy_flux).astype(np.float32)
 
     # 3. speech_intervals: micro-pauses <= 0.25s bridged and duration >= 0.12s
     active = (prob_100hz >= 0.30).astype(np.uint8)
@@ -408,6 +482,10 @@ def run_silero_vad(
     LAST_SPEECH_ENVELOPE = speech_env_list
     LAST_ATTACK_ENVELOPE = attack_env_list
     LAST_SPEECH_INTERVALS = speech_intervals
+    _TLS.vad_result = result
+    _TLS.speech_envelope = speech_env_list
+    _TLS.attack_envelope = attack_env_list
+    _TLS.speech_intervals = speech_intervals
     return result
 
 
@@ -432,6 +510,7 @@ def get_whisper_model():
             if os.path.isdir(cand):
                 download_root = cand
                 break
+        whisper_threads = max(1, int(os.environ.get("SUBSYNC_WHISPER_THREADS", "8")))
         for local_only in (True, False):
             try:
                 _WHISPER_MODEL = WhisperModel(
@@ -440,7 +519,7 @@ def get_whisper_model():
                     compute_type="int8",
                     download_root=download_root,
                     local_files_only=local_only,
-                    cpu_threads=16,
+                    cpu_threads=whisper_threads,
                 )
                 return _WHISPER_MODEL
             except Exception as exc:
@@ -457,8 +536,8 @@ def transcribe_audio_window(
 ) -> List[WhisperUtterance]:
     """Upsample 8 kHz PCM slice `[start_s, end_s]` to 16 kHz and extract word-accurate English utterances."""
     if pcm_bytes is None:
-        pcm_bytes = LAST_PCM_BYTES
-        sample_rate = LAST_SAMPLE_RATE
+        pcm_bytes = get_last_pcm_bytes()
+        sample_rate = getattr(_TLS, "sample_rate", LAST_SAMPLE_RATE)
     if not pcm_bytes or np is None:
         return []
 
@@ -470,7 +549,7 @@ def transcribe_audio_window(
         return []
 
     fp = _pcm_fingerprint(pcm_bytes, sample_rate=sample_rate)
-    cache_key = (fp[0], fp[3], int(round(t0 * 10.0)), int(round(t1 * 10.0)))
+    cache_key = (fp[0], fp[3], fp[4], int(round(t0 * 10.0)), int(round(t1 * 10.0)))
     if cache_key in _WHISPER_CACHE:
         return list(_WHISPER_CACHE[cache_key])
 
@@ -486,13 +565,10 @@ def transcribe_audio_window(
     slice_bytes = pcm_bytes[i0 * 2 : i1 * 2]
     s_in = np.frombuffer(slice_bytes, dtype=np.int16).astype(np.float32) * (1.0 / 32768.0)
 
-    # Upsample from 8000 Hz to 16000 Hz
+    # Bandlimited FFT sinc upsampling from 8000 Hz to 16000 Hz (eliminates 4-8 kHz spectral foldover images)
     if sample_rate == 8000:
         n_in = len(s_in)
-        s_16k = np.empty(n_in * 2, dtype=np.float32)
-        s_16k[0::2] = s_in
-        s_16k[1:-1:2] = 0.5 * (s_in[:-1] + s_in[1:])
-        s_16k[-1] = s_in[-1]
+        s_16k = (np.fft.irfft(np.fft.rfft(s_in), n=n_in * 2) * 2.0).astype(np.float32)
     elif sample_rate == 16000:
         s_16k = s_in
     else:
@@ -865,6 +941,21 @@ _FR_EN_LEXICON: Dict[str, set] = {
     "9h07": {"907", "907am", "9", "07"},
     "5591": {"5591", "5", "9", "1"},
     "3929": {"3929", "39", "29"},
+    "reddington": {"reddington", "redington", "red"},
+    "red": {"red", "reddington", "redington"},
+    "ressler": {"ressler", "resler", "wrestler"},
+    "dembe": {"dembe", "dambi", "demby", "zuma"},
+    "katarina": {"katarina", "caterina", "rostova"},
+    "rostova": {"rostova", "katarina", "caterina"},
+    "aram": {"aram", "aaron", "mojtabai"},
+    "samar": {"samar", "navabi"},
+    "cooper": {"cooper", "harold"},
+    "keen": {"keen", "keane", "liz", "elizabeth"},
+    "liz": {"liz", "elizabeth", "keen"},
+    "elizabeth": {"elizabeth", "liz", "keen"},
+    "panabaker": {"panabaker", "cynthia"},
+    "kaplan": {"kaplan", "kate"},
+    "task": {"task", "force"},
 }
 
 _STOPWORDS_FR = {
@@ -872,7 +963,10 @@ _STOPWORDS_FR = {
     "ce", "ca", "se", "sa", "son", "ses", "je", "tu", "il", "elle", "on",
     "nous", "vous", "ils", "elles", "me", "te", "ne", "pas", "plus", "par",
     "pour", "dans", "avec", "est", "es", "suis", "sont", "ai", "as", "ont",
-    "ete", "etre", "avoir", "fait", "faire", "une", "un",
+    "ete", "etre", "avoir", "fait", "faire", "une", "un", "tout", "tous",
+    "toute", "toutes", "mais", "comme", "meme", "sans", "sous", "chez",
+    "vers", "dont", "leur", "leurs", "cette", "cet", "ces", "mon", "ton",
+    "mes", "tes", "nos", "vos", "qui", "que", "quoi",
 }
 
 
@@ -906,17 +1000,13 @@ def bilingual_utterance_similarity(
         if len(ft) >= 3 and ft in en_toks and ft not in _STOPWORDS_FR:
             hits += 1.65
             continue
-        if ft.isdigit() and (ft in en_toks or ft in en_joined):
+        if ft.isdigit() and (ft in en_toks or (len(ft) >= 3 and ft in en_joined)):
             hits += 1.8
             continue
-        # 2. Cognate / stem prefix match (4+ characters)
-        if len(ft) >= 4 and ft not in _STOPWORDS_FR:
-            prefix4 = ft[:4]
-            prefix5 = ft[:5] if len(ft) >= 5 else prefix4
-            if any(
-                (len(et) >= 5 and et[:5] == prefix5) or (len(et) >= 4 and et[:4] == prefix4)
-                for et in en_toks
-            ):
+        # 2. Cognate / stem prefix match (5+ characters to avoid 4-char stopword collisions)
+        if len(ft) >= 5 and ft not in _STOPWORDS_FR:
+            prefix5 = ft[:5]
+            if any(len(et) >= 5 and et[:5] == prefix5 for et in en_toks):
                 hits += 1.25
                 continue
         # 3. Bilingual lexicon lookup (exact or 5-char stem)
@@ -932,7 +1022,7 @@ def bilingual_utterance_similarity(
                     hits += 0.95
                     break
 
-    content_count = max(1.5, float(sum(1 for t in fr_toks if t not in _STOPWORDS_FR or len(t) >= 4)))
+    content_count = max(1.5, float(sum(1 for t in fr_toks if t not in _STOPWORDS_FR or len(t) >= 5)))
     score = hits / (content_count * 0.75 + 0.8)
 
     # Question mark agreement bonus
@@ -1018,8 +1108,12 @@ def score_scene_with_whisper(
             if b_cand < b_min - 0.65 or b_cand > b_max + 0.65:
                 continue
             sim = bilingual_utterance_similarity(txt_sub, u.text, dur_sub, u.end - u.start)
-            # Base onset coincidence weight + strong lexical match amplification
-            w = 0.22 + (sim ** 1.35) * 1.85
+            if sim >= 0.42:
+                w = (sim ** 1.35) * 2.15
+            elif sim >= 0.22:
+                w = sim * 0.15
+            else:
+                continue
             center_idx = int(round((b_cand - b_min) / step))
             i0 = max(0, center_idx - radius_bins)
             i1 = min(len(grid), center_idx + radius_bins + 1)
@@ -1028,7 +1122,7 @@ def score_scene_with_whisper(
                 k1 = k0 + (i1 - i0)
                 lex_scores[i0:i1] += w * kernel[k0:k1]
 
-    # Add 100 Hz onset cross-correlation between subtitle 0.35s start pulses and Whisper word-onset pulses
+    # Add 100 Hz zero-mean locally-normalized onset cross-correlation
     t_sub_min = min(s for s, _, _ in sub_events)
     t_sub_max = max(e for _, e, _ in sub_events)
     sub_dur = max(2.0, t_sub_max - t_sub_min + 1.0)
@@ -1059,21 +1153,27 @@ def score_scene_with_whisper(
             att_slice = np.asarray(attack_env_100hz[r0:r1], dtype=np.float32)
             whisper_pulses[: r1 - r0] = whisper_pulses[: r1 - r0] + 0.65 * att_slice
 
-    # Evaluate onset correlation along `grid`
+    # Evaluate zero-mean locally-normalized Pearson NCC along `grid`
     sub_len = len(sub_pulses)
     ref_len = len(whisper_pulses)
-    sub_norm = float(np.linalg.norm(sub_pulses)) + 1e-6
+    sub_zero = sub_pulses - float(np.mean(sub_pulses))
+    sub_zero_norm = float(np.linalg.norm(sub_zero))
     onset_scores = np.zeros(len(grid), dtype=np.float32)
-    for idx, b_val in enumerate(grid):
-        shift_frames = int(round((t_sub_min + float(b_val) - t_ref_min) * frame_hz))
-        s0 = max(0, -shift_frames)
-        r0 = max(0, shift_frames)
-        ov = min(sub_len - s0, ref_len - r0)
-        if ov > 10:
-            dot = float(np.dot(sub_pulses[s0 : s0 + ov], whisper_pulses[r0 : r0 + ov]))
-            onset_scores[idx] = dot / sub_norm
+    if sub_zero_norm > 1e-6:
+        for idx, b_val in enumerate(grid):
+            shift_frames = int(round((t_sub_min + float(b_val) - t_ref_min) * frame_hz))
+            s0 = max(0, -shift_frames)
+            r0 = max(0, shift_frames)
+            ov = min(sub_len - s0, ref_len - r0)
+            if ov > 25:
+                s_sl = sub_zero[s0 : s0 + ov]
+                r_sl = whisper_pulses[r0 : r0 + ov]
+                r_sl_zero = r_sl - float(np.mean(r_sl))
+                denom = float(np.linalg.norm(s_sl)) * float(np.linalg.norm(r_sl_zero))
+                if denom > 1e-6:
+                    onset_scores[idx] = float(np.dot(s_sl, r_sl_zero)) / denom
 
-    total_scores = lex_scores + onset_scores * max(1.5, float(len(sub_events)) * 0.35)
+    total_scores = lex_scores + np.maximum(0.0, onset_scores) * max(2.0, float(len(sub_events)) * 0.45)
 
     # Gentle prior regularization if b_prior is provided
     if b_prior is not None:
@@ -1094,6 +1194,88 @@ def score_scene_with_whisper(
         frame_hz=frame_hz,
     )
     return refined_b, best_score, matched_anchors
+
+
+def _count_lexical_hits_at_offset(
+    sub_events: Sequence[Tuple[float, float, str]],
+    utterances: Sequence[WhisperUtterance],
+    b_val: float,
+    tolerance_s: float = 0.55,
+    min_sim: float = 0.48,
+) -> int:
+    """Count distinct subtitle lines matching a Whisper utterance within `±tolerance_s` at `b_val`."""
+    hits = 0
+    for s_sub, e_sub, txt_sub in sub_events:
+        if not txt_sub:
+            continue
+        pred_s = s_sub + b_val
+        for u in utterances:
+            if abs(u.start - pred_s) <= tolerance_s:
+                if bilingual_utterance_similarity(txt_sub, u.text, e_sub - s_sub, u.end - u.start) >= min_sim:
+                    hits += 1
+                    break
+    return hits
+
+
+def verify_act_offset_with_whisper(
+    act_orig: Sequence[Tuple[float, float]],
+    b_current: float,
+    b_min: float,
+    b_max: float,
+    b_prior: Optional[float] = None,
+    frame_hz: int = 100,
+) -> Optional[Dict[str, Any]]:
+    """Arbitrate an ambiguous or high-density act's offset `b` using cached PCM + Faster-Whisper."""
+    pcm_bytes = get_last_pcm_bytes()
+    vad_res = get_last_vad_result()
+    if pcm_bytes is None or vad_res is None or np is None:
+        return None
+    enriched = [ev for ev in enrich_intervals_with_text(act_orig) if ev[2]]
+    if len(enriched) < 4 or b_max <= b_min + 0.10:
+        return None
+
+    t0_sub = enriched[0][0]
+    t1_sub = min(enriched[-1][1], t0_sub + 62.0)
+    slice_evs = [ev for ev in enriched if ev[0] <= t0_sub + 60.0]
+    if len(slice_evs) < 4:
+        slice_evs = enriched[: min(len(enriched), 24)]
+        t1_sub = slice_evs[-1][1]
+
+    sr = getattr(_TLS, "sample_rate", LAST_SAMPLE_RATE)
+    audio_dur = (len(pcm_bytes) // 2) / float(sr)
+    audio_t0 = max(0.0, t0_sub + b_min - 3.0)
+    audio_t1 = min(audio_dur, t1_sub + b_max + 3.0)
+    if audio_t1 - audio_t0 < 4.0:
+        return None
+
+    utts = transcribe_audio_window(
+        pcm_bytes,
+        start_s=audio_t0,
+        end_s=audio_t1,
+        sample_rate=sr,
+    )
+    if len(utts) < 3:
+        return None
+
+    b_wh, sc_wh, anc_wh = score_scene_with_whisper(
+        slice_evs,
+        utts,
+        b_min=b_min,
+        b_max=b_max,
+        b_prior=b_prior,
+        attack_env_100hz=get_last_attack_envelope(),
+        frame_hz=frame_hz,
+    )
+    lex_wh = _count_lexical_hits_at_offset(slice_evs, utts, b_wh)
+    lex_cur = _count_lexical_hits_at_offset(slice_evs, utts, b_current)
+    return {
+        "b": float(b_wh),
+        "score": float(sc_wh),
+        "anchors_count": len(anc_wh),
+        "lexical_hits": int(lex_wh),
+        "lexical_hits_current": int(lex_cur),
+        "evaluated_events": len(slice_evs),
+    }
 
 
 def refine_scene_offset_from_utterances(
@@ -1216,16 +1398,16 @@ def verify_scenes_with_whisper(
       - `piecewise_anchors`: `(x_center, y_center)` anchors for piecewise-linear interpolation.
     """
     if pcm_bytes is None:
-        pcm_bytes = LAST_PCM_BYTES
-        sample_rate = LAST_SAMPLE_RATE
+        pcm_bytes = get_last_pcm_bytes()
+        sample_rate = getattr(_TLS, "sample_rate", LAST_SAMPLE_RATE)
     elif isinstance(pcm_bytes, str) and os.path.isfile(pcm_bytes):
         with open(pcm_bytes, "rb") as fp:
             pcm_bytes = fp.read()
 
     if attack_env_100hz is None:
-        attack_env_100hz = LAST_ATTACK_ENVELOPE
+        attack_env_100hz = get_last_attack_envelope()
     if speech_intervals is None:
-        speech_intervals = LAST_SPEECH_INTERVALS
+        speech_intervals = get_last_speech_intervals()
 
     # If scenes is a 2-tuple of floats representing time_window (t0, t1)
     if (

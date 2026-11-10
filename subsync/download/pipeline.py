@@ -549,10 +549,6 @@ def get_cached_speech_envelope(
     from subsync.synchro import vad
 
     key = (str(Path(video_path).resolve()), stream_index, stream_type, int(frame_hz))
-    cached = _REF_ENVELOPE_CACHE.get(key)
-    if cached is not None:
-        return cached
-
     orig_fn = getattr(vad, "_orig_extract_speech_envelope", vad.extract_speech_envelope)
     env, intervals = orig_fn(
         str(video_path),
@@ -571,57 +567,8 @@ def get_cached_speech_envelope(
 
 @contextmanager
 def _cached_reference_envelope_context(video_path: Path):
-    """Temporarily wrap `vad.extract_speech_envelope` so multi-candidate evaluation extracts audio once."""
-    try:
-        from subsync.synchro import vad
-    except ImportError:
-        yield
-        return
-
-    if getattr(vad, "_orig_extract_speech_envelope", None) is not None:
-        # Already wrapped by an outer context
-        yield
-        return
-
-    orig_fn = vad.extract_speech_envelope
-    vad._orig_extract_speech_envelope = orig_fn
-    target_resolved = str(Path(video_path).resolve())
-
-    def _cached_extract(
-        path: str,
-        stream_index: Optional[int] = None,
-        stream_type: Optional[str] = None,
-        encoding: str = "utf-8",
-        fps: Optional[float] = None,
-        frame_hz: int = vad.FRAME_HZ,
-    ):
-        try:
-            if str(Path(path).resolve()) == target_resolved:
-                return get_cached_speech_envelope(
-                    path,
-                    stream_index=stream_index,
-                    stream_type=stream_type,
-                    encoding=encoding,
-                    fps=fps,
-                    frame_hz=frame_hz,
-                )
-        except Exception:
-            pass
-        return orig_fn(
-            path,
-            stream_index=stream_index,
-            stream_type=stream_type,
-            encoding=encoding,
-            fps=fps,
-            frame_hz=frame_hz,
-        )
-
-    vad.extract_speech_envelope = _cached_extract
-    try:
-        yield
-    finally:
-        vad.extract_speech_envelope = orig_fn
-        delattr(vad, "_orig_extract_speech_envelope")
+    """Ensure multi-candidate evaluation reuses the thread-safe cache in `vad.extract_speech_envelope`."""
+    yield
 
 
 _SRT_FULL_BLOCK_RE = re.compile(
@@ -1132,17 +1079,19 @@ def _has_preferred_release_tag(cand: SubtitleCandidate) -> bool:
 def _candidate_alignment_quality(metrics: Dict[str, Any], cand: SubtitleCandidate) -> float:
     """
     Compute composite alignment quality score for candidate selection:
-      - Higher correlation score is better.
+      - Higher correlation score and post-sync vocal coverage are better.
       - Large multi-act window offset spread (`window_spread_s`) is penalized so clean
         WEB-DL/BluRay transfers win over HDTV commercial-break cuts.
-      - Minor tie-breaker for preferred release tags and metadata ranking score.
+      - Release-tag bonus for preferred WEB-DL/BluRay/PROPER masters and metadata ranking score.
     """
     corr = float(metrics.get("correlation_score") or 0.0)
+    post_vocal = metrics.get("post_vocal_score")
+    vocal_bonus = 0.25 * max(0.0, float(post_vocal) - 0.80) if post_vocal is not None else 0.0
     spread = float(metrics.get("window_spread_s") or 0.0)
-    spread_penalty = 0.005 * max(0.0, spread - 2.0) + 0.012 * max(0.0, spread - 10.0)
-    tag_bonus = 0.003 if _has_preferred_release_tag(cand) else 0.0
-    rank_bonus = min(0.002, max(0.0, float(getattr(cand, "score", 0.0) or 0.0)) * 1e-5)
-    return corr - spread_penalty + tag_bonus + rank_bonus
+    spread_penalty = 0.008 * max(0.0, spread - 1.5) + 0.015 * max(0.0, spread - 8.0)
+    tag_bonus = 0.025 if _has_preferred_release_tag(cand) else 0.0
+    rank_bonus = min(0.005, max(0.0, float(getattr(cand, "score", 0.0) or 0.0)) * 2e-5)
+    return corr + vocal_bonus - spread_penalty + tag_bonus + rank_bonus
 
 
 def _should_evaluate_more_candidates(
@@ -1157,20 +1106,20 @@ def _should_evaluate_more_candidates(
         return False
 
     corr = float(metrics.get("correlation_score") or 0.0)
+    post_vocal = metrics.get("post_vocal_score")
     spread = float(metrics.get("window_spread_s") or 0.0)
 
-    # Low correlation (< 0.38) always triggers evaluation of backup candidates
-    if corr < 0.38:
+    # Low/moderate correlation (< 0.56) or suboptimal vocal coverage (< 0.85) triggers evaluation
+    if corr < 0.56 or (post_vocal is not None and float(post_vocal) < 0.85):
         return True
 
-    # Large multi-act commercial-break drift (> 10.0s) triggers evaluation when another
-    # cached or downloadable candidate (especially WEB-DL / BluRay / PROPER) is available
-    if spread > 10.0:
+    # Multi-act commercial-break drift (> 2.5s) triggers evaluation of backup candidates
+    if spread > 2.5:
         return True
 
     # If another candidate in top 3 is already cached on disk AND is a preferred release
-    # while current candidate has moderate multi-act drift (> 3.5s), compare for free
-    if spread > 3.5:
+    # while current candidate has any multi-act drift (> 1.0s), compare for free
+    if spread > 1.0:
         for prov, cand in remaining_cands:
             if _is_candidate_cached(prov, cand) and _has_preferred_release_tag(cand):
                 return True
@@ -1222,6 +1171,17 @@ def _process_single_episode(
         return result
 
     discovered_pairs: List[Tuple[SubtitleProvider, SubtitleCandidate]] = []
+    raw_cache_dir = resolved_cache_dir / "raw"
+    raw_cache_dir.mkdir(parents=True, exist_ok=True)
+    raw_srt_path = raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.raw.srt"
+    preexisting_raw_text: Optional[str] = None
+    if not dry_run and raw_srt_path.is_file():
+        try:
+            if raw_srt_path.stat().st_size > 128:
+                preexisting_raw_text = raw_srt_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            preexisting_raw_text = None
+
     provider_errors: List[str] = []
     dl_errors: List[str] = []
 
@@ -1241,7 +1201,7 @@ def _process_single_episode(
         if dry_run:
             break
 
-    if not discovered_pairs:
+    if not discovered_pairs and not preexisting_raw_text:
         err_detail = "; ".join(provider_errors) if provider_errors else "No matching subtitles found"
         raise ProviderError(
             f"No '{lang_spec.iso639_1}' subtitles found for {meta.series_name} {meta.episode_code} ({err_detail})"
@@ -1261,10 +1221,6 @@ def _process_single_episode(
                 file=sys.stderr,
             )
         return result
-
-    raw_cache_dir = resolved_cache_dir / "raw"
-    raw_cache_dir.mkdir(parents=True, exist_ok=True)
-    raw_srt_path = raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.raw.srt"
 
     rate_limited_providers = set()
     evaluated_candidates: List[Dict[str, Any]] = []
@@ -1296,16 +1252,8 @@ def _process_single_episode(
                 continue
 
             cand_idx = len(evaluated_candidates)
-            cand_raw_path = (
-                raw_srt_path
-                if cand_idx == 0
-                else raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.cand{cand_idx}.raw.srt"
-            )
-            cand_out_path = (
-                out_path
-                if cand_idx == 0
-                else raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.cand{cand_idx}.synced.srt"
-            )
+            cand_raw_path = raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.cand{cand_idx}.raw.srt"
+            cand_out_path = raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.cand{cand_idx}.synced.srt"
             cand_raw_path.write_text(normalized_srt_text, encoding="utf-8", newline="\n")
 
             try:
@@ -1343,17 +1291,80 @@ def _process_single_episode(
                 sync_errors.append(f"{prov.name}({cand.release_version}): {sync_exc}")
                 continue
             finally:
-                if cand_idx > 0:
-                    for tmp_p in (cand_raw_path, cand_out_path):
-                        try:
-                            if tmp_p.exists():
-                                tmp_p.unlink()
-                        except OSError:
-                            pass
+                for tmp_p in (cand_raw_path, cand_out_path):
+                    try:
+                        if tmp_p.exists():
+                            tmp_p.unlink()
+                    except OSError:
+                        pass
 
             remaining = discovered_pairs[pair_idx + 1 : pair_idx + 1 + (max_eval_candidates - len(evaluated_candidates))]
             if not _should_evaluate_more_candidates(sync_metrics, remaining):
                 break
+
+        # Local raw-cache safety net: if providers were rate-limited or a previously chosen
+        # release already exists in `raw_srt_path` (`~/.cache/subsync/raw/`) and wasn't among
+        # the freshly evaluated candidates, evaluate it so cached runs never fail or regress.
+        if preexisting_raw_text and (
+            not evaluated_candidates
+            or (
+                (dl_errors or max(e["quality"] for e in evaluated_candidates) < 0.52)
+                and all(e["raw_text"] != preexisting_raw_text for e in evaluated_candidates)
+            )
+        ):
+            fb_raw_path = raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.cached_fb.raw.srt"
+            fb_out_path = raw_cache_dir / f"{meta.video_path.stem}.{lang_spec.iso639_1}.cached_fb.synced.srt"
+            try:
+                fb_raw_path.write_text(preexisting_raw_text, encoding="utf-8", newline="\n")
+                fb_metrics = synchronize_episode_subtitle(
+                    video_path=meta.video_path,
+                    raw_srt_path=fb_raw_path,
+                    out_srt_path=fb_out_path,
+                    ref_lang=effective_audio_lang,
+                    sub_lang=lang_spec.iso639_2,
+                    timeout=task_timeout,
+                    sync_fn=sync_fn,
+                )
+                fb_synced_text = (
+                    fb_out_path.read_text(encoding="utf-8")
+                    if fb_out_path.exists()
+                    else shift_srt_text(
+                        preexisting_raw_text,
+                        offset_seconds=float(fb_metrics.get("offset_seconds") or 0.0),
+                        speed_factor=float(fb_metrics.get("speed_factor") or 1.0),
+                        formula=fb_metrics.get("formula"),
+                    )
+                )
+                fb_cand = SubtitleCandidate(
+                    provider_name="cache",
+                    series_name=meta.series_name,
+                    season=meta.season,
+                    episode=meta.episode,
+                    language=lang_spec.iso639_1,
+                    release_version="raw-cache",
+                    download_url=str(raw_srt_path),
+                )
+                fb_prov = providers[0] if providers else MockSubtitleProvider()
+                fb_quality = _candidate_alignment_quality(fb_metrics, fb_cand)
+                evaluated_candidates.append(
+                    {
+                        "prov": fb_prov,
+                        "cand": fb_cand,
+                        "raw_text": preexisting_raw_text,
+                        "synced_text": fb_synced_text,
+                        "metrics": fb_metrics,
+                        "quality": fb_quality,
+                    }
+                )
+            except Exception as fb_exc:
+                sync_errors.append(f"raw-cache: {fb_exc}")
+            finally:
+                for tmp_p in (fb_raw_path, fb_out_path):
+                    try:
+                        if tmp_p.exists():
+                            tmp_p.unlink()
+                    except OSError:
+                        pass
 
     if not evaluated_candidates:
         if dl_errors and not sync_errors:
@@ -1431,6 +1442,10 @@ def _process_single_episode(
 def _process_episode_in_worker(task_payload: Dict[str, Any]) -> EpisodeSyncResult:
     """Isolated worker-process entry point for multi-core episode synchronization."""
     ep_start = time.monotonic()
+    threads_per_worker = str(max(1, int(task_payload.get("threads_per_worker", 4))))
+    os.environ["SUBSYNC_WHISPER_THREADS"] = threads_per_worker
+    os.environ.setdefault("OMP_NUM_THREADS", threads_per_worker)
+    os.environ.setdefault("MKL_NUM_THREADS", threads_per_worker)
     idx = int(task_payload["idx"])
     total_episodes = int(task_payload["total_episodes"])
     meta: SeriesEpisodeMetadata = task_payload["meta"]
@@ -1600,6 +1615,8 @@ def run_series_sync(
                 except Exception:
                     continue
 
+        active_workers = min(resolved_workers, len(episodes))
+        threads_per_worker = max(1, min(6, cpu_cores // max(1, active_workers)))
         payloads = []
         for idx, meta in enumerate(episodes, start=1):
             effective_audio_lang = ref_lang or meta.audio_lang or "eng"
@@ -1622,10 +1639,11 @@ def run_series_sync(
                     "skip_if_exists": skip_if_exists,
                     "task_timeout": task_timeout,
                     "quiet": quiet,
+                    "threads_per_worker": threads_per_worker,
                 }
             )
 
-        with ProcessPoolExecutor(max_workers=min(resolved_workers, len(episodes))) as pool:
+        with ProcessPoolExecutor(max_workers=active_workers) as pool:
             for result in pool.map(_process_episode_in_worker, payloads):
                 if result.status == "SKIPPED":
                     skipped += 1
