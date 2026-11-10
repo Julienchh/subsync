@@ -980,7 +980,7 @@ def _ncc_curve_act_np(
         seg_rel,
         duration_s=(w_end - w_start),
         frame_hz=frame_hz,
-        edge_boost=0.20,
+        edge_boost=0.20 if raw_duty > 0.72 else 0.35,
     )
     w_len = len(w_env)
     if w_len == 0:
@@ -1012,7 +1012,7 @@ def _ncc_curve_act_np(
     r_var = np.maximum(1e-9, r_sq - (r_sum * r_sum) / float(w_len))
     c_boxcar = dots / (np.sqrt(r_var) * w_norm)
 
-    if ref_attack_arr is None or len(act_scaled) < 3:
+    if ref_attack_arr is None or len(act_scaled) < 4 or raw_duty <= 0.72:
         return c_boxcar
 
     # Build 100 Hz subtitle sentence-onset impulse template with symmetric Gaussian lead tolerance
@@ -1061,8 +1061,8 @@ def _ncc_curve_act_np(
     a_var = np.maximum(1e-9, a_sq - (a_sum * a_sum) / float(w_len))
     c_onset = dots_o / (np.sqrt(a_var) * o_norm)
 
-    # Blend onset correlation from 18% (sparse dialogue) up to 52% (wall-to-wall continuous dialogue)
-    alpha = min(0.52, max(0.18, 0.18 + 1.15 * max(0.0, raw_duty - 0.65)))
+    # Blend onset correlation for dense/wall-to-wall continuous dialogue (raw_duty > 0.72)
+    alpha = min(0.52, max(0.15, 0.15 + 1.40 * (raw_duty - 0.72)))
     return (1.0 - alpha) * c_boxcar + alpha * np.maximum(-0.20, c_onset)
 
 
@@ -1180,7 +1180,6 @@ def _analyze_episode_windows(
         dur = cur_scaled[-1][1] - cur_scaled[0][0]
         if (
             (cur_scaled[0][0] < 120.0 and gap >= 6.0 and len(cur_scaled) >= 4)
-            or (gap >= 8.0 and len(cur_scaled) >= 2)
             or (gap >= 6.0 and len(cur_scaled) >= 5 and dur >= 14.0)
             or (gap >= 3.5 and len(cur_scaled) >= 7 and dur >= 22.0)
             or (gap >= 2.2 and len(cur_scaled) >= 10 and dur >= 38.0)
@@ -1298,19 +1297,57 @@ def _analyze_episode_windows(
             curr = int(back[w, curr])
         coarse_path.reverse()
 
-        # 3. Detect orphan "Précédemment..." recap in Act 0 that was cut from the start of the video
-        if (
-            num_acts >= 2
-            and acts_scaled[0][0][0] < 10.0
-            and acts_scaled[0][-1][1] < 60.0
-            and coarse_path[1][0] < -15.0
-        ):
+        # 3. Detect orphan "Précédemment..." recap in early acts (Act 0 / Act 1) that was cut from the start of the video
+        post_recap_k = None
+        if num_acts >= 2 and acts_scaled[0][0][0] < 10.0 and acts_scaled[0][-1][1] < 60.0:
             if (
-                acts_scaled[1][0][0] + coarse_path[1][0] < acts_scaled[0][-1][1] + 5.0
-                and coarse_path[0][1] < 0.25
+                num_acts >= 3
+                and acts_scaled[1][-1][1] < 60.0
+                and coarse_path[2][0] < -15.0
+                and (
+                    coarse_path[1][0] > coarse_path[2][0] + 3.5
+                    or acts_scaled[1][0][0] + coarse_path[2][0] < -2.0
+                )
             ):
-                orphan_b = min(coarse_path[1][0], -acts_scaled[0][-1][1] - 1.5)
-                coarse_path[0] = (orphan_b, coarse_path[1][1])
+                post_recap_k = 2
+            elif coarse_path[1][0] < -15.0:
+                post_recap_k = 1
+            if post_recap_k is not None:
+                b_post, sc_post = coarse_path[post_recap_k]
+                for w_rec in range(post_recap_k):
+                    end_in_vid = acts_scaled[w_rec][-1][1] + b_post
+                    if end_in_vid <= 2.5 and (
+                        coarse_path[w_rec][1] < 0.28 or coarse_path[w_rec][0] > b_post + 4.0
+                    ):
+                        orphan_b = min(b_post, -acts_scaled[w_rec][-1][1] - 1.5)
+                        coarse_path[w_rec] = (orphan_b, sc_post)
+                    elif (
+                        acts_scaled[w_rec][0][0] + b_post < -2.0
+                        and end_in_vid > 0.5
+                        and coarse_path[w_rec][0] > b_post + 3.5
+                    ):
+                        in_vid_w = [
+                            (s, e) for s, e in acts_scaled[w_rec] if s + b_post >= -1.5
+                        ]
+                        if len(in_vid_w) == 1 and ref_intervals:
+                            s_open = in_vid_w[0][0]
+                            early_refs = [
+                                rs
+                                for rs, re_t in ref_intervals
+                                if rs < 12.0 and (re_t - rs) >= 0.40
+                            ]
+                            if early_refs:
+                                best_r0 = min(
+                                    early_refs, key=lambda r_s: abs((r_s - s_open) - b_post)
+                                )
+                                if abs((best_r0 - s_open) - b_post) <= 3.5:
+                                    coarse_path[w_rec] = (best_r0 - s_open, sc_post)
+                                else:
+                                    coarse_path[w_rec] = (b_post, sc_post)
+                            else:
+                                coarse_path[w_rec] = (b_post, sc_post)
+                        elif len(in_vid_w) >= 2:
+                            coarse_path[w_rec] = (b_post, sc_post)
 
         # If Act 0 contains both an unvoiced recap (s + cb < -1.0s) and the opening scene (s + cb >= -1.0s),
         # re-evaluate Act 0's NCC curve on only the in-video opening scene so the unvoiced recap doesn't bias cb.
@@ -1339,7 +1376,11 @@ def _analyze_episode_windows(
                     coarse_path[0] = ((best0 - pad_frames) / float(frame_hz), float(c0_clean[best0]))
 
         # 3b. Plateau-Aware Consensus & Change-Point Stabilization:
-        start_cons_idx = 1 if (num_acts >= 2 and coarse_path[0][0] < -10.0) else 0
+        start_cons_idx = (
+            post_recap_k
+            if post_recap_k is not None
+            else (1 if (num_acts >= 2 and coarse_path[0][0] < -10.0) else 0)
+        )
         if num_acts - start_cons_idx >= 2:
             sum_curve = np.sum([curves[w] for w in range(start_cons_idx, num_acts)], axis=0)
             best_const_idx = int(np.argmax(sum_curve))
@@ -1689,87 +1730,82 @@ def align_intervals_and_envelopes(
             sum(w["score"] for w in win_chain) / float(len(win_chain)) if win_chain else 0.0
         )
 
-        # 3a. Adaptive Linear Drift Pre-Scaling for episodes with true continuous progressive drift
-        # (vs discrete commercial-break step functions where >= 45% of adjacent act transitions are flat plateaus)
+        # 3a. Adaptive Linear Drift Pre-Scaling for episodes with progressive drift (e.g. uncut/extended
+        # masters vs broadcast cuts or non-standard speed transfers where offset drifts by >= 5s across the episode)
         if allow_drift and len(win_chain) >= 6 and np is not None:
-            start_d_idx = (
-                1
-                if (
-                    win_chain[0]["x_start"] < 60.0
-                    and (win_chain[0]["b"] < -10.0 or win_chain[0]["b"] < win_chain[1]["b"] - 6.0)
+            start_d_idx = 0
+            while (
+                start_d_idx < min(2, len(win_chain) - 4)
+                and win_chain[start_d_idx]["x_start"] < 60.0
+                and (
+                    win_chain[start_d_idx]["b"] < -10.0
+                    or win_chain[start_d_idx]["b"] < win_chain[start_d_idx + 1]["b"] - 6.0
                 )
-                else 0
-            )
+            ):
+                start_d_idx += 1
             post_acts = [w for w in win_chain[start_d_idx:] if w["score"] >= 0.28]
             if len(post_acts) >= 5:
                 xs_d = np.array([w["x_center"] for w in post_acts], dtype=np.float64)
                 bs_d = np.array([w["b"] for w in post_acts], dtype=np.float64)
                 scs_d = np.array([w["score"] for w in post_acts], dtype=np.float64)
-                adj_diffs = np.abs(np.diff(bs_d))
-                frac_flat_adj = float(np.mean(adj_diffs <= 0.35)) if len(adj_diffs) > 0 else 1.0
-                # If >= 45% of adjacent act transitions are flat plateaus (<= 0.35s), the offset pattern
-                # is a piecewise-constant commercial-break staircase (a = 1.0), NOT continuous linear drift!
-                if frac_flat_adj < 0.45:
-                    pair_slopes = []
-                    for i_d in range(len(post_acts)):
-                        for j_d in range(i_d + 1, len(post_acts)):
-                            dx_d = xs_d[j_d] - xs_d[i_d]
-                            if dx_d >= 350.0:
-                                pair_slopes.append((bs_d[j_d] - bs_d[i_d]) / dx_d)
-                    slope_cands: List[float] = []
-                    if pair_slopes:
-                        med_s = float(np.median(pair_slopes))
-                        if abs(med_s * t_span) >= 5.0 and abs(med_s) <= 0.05:
-                            slope_cands.append(1.0 + med_s)
-                    try:
-                        ols_s, _ = np.polyfit(xs_d, bs_d, 1, w=scs_d)
-                        ols_s = float(ols_s)
-                        if abs(ols_s * t_span) >= 5.0 and abs(ols_s) <= 0.05:
-                            if not slope_cands or abs((1.0 + ols_s) - slope_cands[0]) > 0.0004:
-                                slope_cands.append(1.0 + ols_s)
-                    except Exception:
-                        pass
+                pair_slopes = []
+                for i_d in range(len(post_acts)):
+                    for j_d in range(i_d + 1, len(post_acts)):
+                        dx_d = xs_d[j_d] - xs_d[i_d]
+                        if dx_d >= 350.0:
+                            pair_slopes.append((bs_d[j_d] - bs_d[i_d]) / dx_d)
+                slope_cands: List[float] = []
+                if pair_slopes:
+                    med_s = float(np.median(pair_slopes))
+                    if abs(med_s * t_span) >= 5.0 and abs(med_s) <= 0.05:
+                        slope_cands.append(1.0 + med_s)
+                try:
+                    ols_s, _ = np.polyfit(xs_d, bs_d, 1, w=scs_d)
+                    ols_s = float(ols_s)
+                    if abs(ols_s * t_span) >= 5.0 and abs(ols_s) <= 0.05:
+                        if not slope_cands or abs((1.0 + ols_s) - slope_cands[0]) > 0.0004:
+                            slope_cands.append(1.0 + ols_s)
+                except Exception:
+                    pass
 
-                    spread_1 = (
-                        max(w["b"] for w in win_chain[start_d_idx:])
-                        - min(w["b"] for w in win_chain[start_d_idx:])
+                spread_1 = (
+                    max(w["b"] for w in win_chain[start_d_idx:])
+                    - min(w["b"] for w in win_chain[start_d_idx:])
+                )
+                for cand_a_drift in slope_cands:
+                    cand_chain, cand_tot = _analyze_episode_windows(
+                        ref_envelope=ref_envelope,
+                        ref_intervals=ref_intervals,
+                        sub_intervals=sub_intervals,
+                        scale_a=cand_a_drift,
+                        frame_hz=frame_hz,
+                        max_win_lag=max_win_lag,
                     )
-                    for cand_a_drift in slope_cands:
-                        cand_chain, cand_tot = _analyze_episode_windows(
-                            ref_envelope=ref_envelope,
-                            ref_intervals=ref_intervals,
-                            sub_intervals=sub_intervals,
-                            scale_a=cand_a_drift,
-                            frame_hz=frame_hz,
-                            max_win_lag=max_win_lag,
-                        )
-                        if len(cand_chain) >= 5:
-                            c_start = (
-                                1
-                                if (
-                                    cand_chain[0]["x_start"] < 60.0
-                                    and (
-                                        cand_chain[0]["b"] < -10.0
-                                        or cand_chain[0]["b"] < cand_chain[1]["b"] - 6.0
-                                    )
-                                )
-                                else 0
+                    if len(cand_chain) >= 5:
+                        c_start = 0
+                        while (
+                            c_start < min(2, len(cand_chain) - 4)
+                            and cand_chain[c_start]["x_start"] < 60.0
+                            and (
+                                cand_chain[c_start]["b"] < -10.0
+                                or cand_chain[c_start]["b"] < cand_chain[c_start + 1]["b"] - 6.0
                             )
-                            cand_mean = sum(w["score"] for w in cand_chain) / float(len(cand_chain))
-                            cand_bs = [float(w["b"]) for w in cand_chain[c_start:]]
-                            cand_spread = max(cand_bs) - min(cand_bs)
-                            cand_med = float(np.median(cand_bs))
-                            cand_mad = float(np.median(np.abs(np.asarray(cand_bs) - cand_med)))
-                            if (
-                                cand_mean >= mean_1_score + 0.020
-                                and cand_spread <= min(0.85, spread_1 * 0.35)
-                                and cand_mad <= 0.18
-                            ):
-                                best_a = cand_a_drift
-                                win_chain = cand_chain
-                                win_tot = cand_tot
-                                mean_1_score = cand_mean
-                                spread_1 = cand_spread
+                        ):
+                            c_start += 1
+                        cand_mean = sum(w["score"] for w in cand_chain) / float(len(cand_chain))
+                        cand_spread = (
+                            max(w["b"] for w in cand_chain[c_start:])
+                            - min(w["b"] for w in cand_chain[c_start:])
+                        )
+                        if (
+                            (cand_mean >= mean_1_score + 0.012 and cand_spread < spread_1 * 0.70)
+                            or (cand_mean >= mean_1_score + 0.002 and cand_spread < spread_1 * 0.25)
+                        ):
+                            best_a = cand_a_drift
+                            win_chain = cand_chain
+                            win_tot = cand_tot
+                            mean_1_score = cand_mean
+                            spread_1 = cand_spread
 
         # Only evaluate canonical PAL/NTSC ratios on full episodes if correlation is still weak (< 0.25 mean),
         # and require a uniform constant offset (spread < 3.0s) across >= 6 acts with > 35% score gain.

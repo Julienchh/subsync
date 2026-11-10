@@ -494,13 +494,13 @@ class Subtitles(pysubs2.SSAFile):
             k_s = int(round(s_sec * frame_hz))
             k_e = int(round(e_sec * frame_hz))
 
-            # 1A. Anti-Early Start (Dead Silence Stripping up to +0.80s):
+            # 1A. Anti-Early Start (Dead Silence Stripping up to +1.15s):
             # If the subtitle appears while nobody is speaking yet (VAD < 0.20 at s_sec),
             # delay `new_s` right onto the actual speech onset when the actor starts speaking.
             if 5 <= k_s < env_len - 25:
                 initial_slice = ref_envelope[k_s : min(env_len, k_s + int(round(0.08 * frame_hz)))]
                 if initial_slice and (sum(initial_slice) / len(initial_slice)) < 0.20 and max(initial_slice) < 0.35:
-                    max_wait_s = min(e_sec - 0.35, s_sec + 0.80)
+                    max_wait_s = min(e_sec - 0.35, s_sec + 1.15)
                     max_wait_k = min(env_len - 6, int(round(max_wait_s * frame_hz)))
                     for k in range(k_s + 2, max_wait_k + 1):
                         pre_sil = ref_envelope[k_s:k]
